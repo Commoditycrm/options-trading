@@ -36,6 +36,7 @@ from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, events
 from app.services.crypto import decrypt_json
+from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
 from app.services.pnl import today_realized_pnl
 
 MAX_PARALLEL = 32
@@ -235,9 +236,14 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
             ))
 
     # ── Phase 2: fire all broker calls in parallel ─────────────────────────
+    # Uses place_order_with_recovery so transient broker errors auto-retry and
+    # user-fixable errors (after-hours market order, expired option, etc.)
+    # surface a clean reject_reason to the subscriber instead of raw 4xx text.
     def _place(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, str | None]:
         try:
-            return item, item.adapter.place_order(item.request), None
+            return item, place_order_with_recovery(item.adapter, item.request), None
+        except RecoverableOrderError as rec:
+            return item, None, rec.friendly_message[:480]
         except Exception as exc:  # noqa: BLE001
             return item, None, str(exc)[:480]
 

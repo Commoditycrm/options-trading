@@ -16,6 +16,7 @@ from app.models.user import User, UserRole
 from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
 from app.services import audit, copy_engine, events, fills_sync
 from app.services.crypto import decrypt_json
+from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
 from app.services.pnl import realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
@@ -192,7 +193,8 @@ def _submit_to_broker_in_background(
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
-            result = adapter.place_order(
+            result = place_order_with_recovery(
+                adapter,
                 BrokerOrderRequest(
                     instrument_type=order.instrument_type,
                     symbol=order.symbol,
@@ -205,8 +207,28 @@ def _submit_to_broker_in_background(
                     option_strike=order.option_strike,
                     option_right=order.option_right,
                     client_order_id=str(order.id),
-                )
+                ),
             )
+        except RecoverableOrderError as rec:
+            # Broker rejected with a well-known cause — give the user the
+            # cleaned-up message but log the raw error for support diagnostics.
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = rec.friendly_message[:480]
+            order.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db, actor_user_id=actor.id, action="trader.order_rejected_at_broker",
+                entity_type="order", entity_id=order.id,
+                metadata={
+                    "friendly": rec.friendly_message,
+                    "raw_error": str(rec.original)[:480],
+                    "classification": "user_fixable",
+                },
+                ip_address=ip_address,
+            )
+            db.commit()
+            db.refresh(order)
+            events.publish(actor.id, copy_engine._order_event("order.updated", order))
+            return
         except Exception as exc:  # noqa: BLE001
             order.status = OrderStatus.REJECTED
             order.reject_reason = str(exc)[:480]
