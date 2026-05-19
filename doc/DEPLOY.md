@@ -68,3 +68,16 @@ When the team is ready for AWS:
 | `FRONTEND_BASE_URL` | backend | Used in password-reset emails. |
 | `BACKEND_URL` | Vercel (server) | Render URL. Used by Next.js rewrites. |
 | `NEXT_PUBLIC_API_BASE_URL` | Vercel (browser) | Render URL. Used by EventSource. Required for live updates in production. |
+| `IBKR_CONSUMER_KEY` | backend (optional) | App-level. Issued by IBKR on third-party API onboarding approval. Leave blank to disable the IBKR broker option. |
+| `IBKR_DH_PARAM_PEM` | backend (optional) | Multiline PEM contents (not a file path). Generate per IBKR's onboarding docs; upload the public half to your IBKR developer console. |
+| `IBKR_PRIVATE_ENCRYPTION_PEM` | backend (optional) | Multiline PEM contents. Same pattern as DH param. |
+| `IBKR_PRIVATE_SIGNATURE_PEM` | backend (optional) | Multiline PEM contents. Same pattern. |
+
+### IBKR onboarding (one-time, app-level)
+
+The IBKR broker option will surface in the UI as soon as the adapter is deployed, but **connect attempts return 501 until all four `IBKR_*` env vars are set**. To enable:
+
+1. Email `webapionboarding@interactivebrokers.com` to start the third-party API approval flow. Expect 1–2 weeks for Compliance review.
+2. Once approved, generate the three signing PEMs locally per IBKR's docs and upload the public halves to your IBKR developer console.
+3. IBKR returns the `consumer_key`. Set the four `IBKR_*` env vars in Render.
+4. Each end-user (subscriber) then authorizes against IBKR via OAuth and pastes their access token + access token secret + account ID into the broker connect form.

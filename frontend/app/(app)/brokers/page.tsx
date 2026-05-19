@@ -36,10 +36,22 @@ function fmtRelative(iso: string | null): string {
 
 export default function BrokersPage() {
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
+  // Which form to render (only one broker form at a time).
+  const [brokerType, setBrokerType] = useState<"alpaca" | "ibkr">("alpaca");
+
+  // Alpaca form
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
   const [paper, setPaper] = useState(true);
+
+  // IBKR form
+  const [ibkrLabel, setIbkrLabel] = useState("");
+  const [ibkrAccessToken, setIbkrAccessToken] = useState("");
+  const [ibkrAccessTokenSecret, setIbkrAccessTokenSecret] = useState("");
+  const [ibkrAccountId, setIbkrAccountId] = useState("");
+  const [ibkrPaper, setIbkrPaper] = useState(false);
+
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
 
@@ -65,6 +77,33 @@ export default function BrokersPage() {
       await load();
     } catch (e) {
       notify.fromError(e, "Broker connect failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function connectIbkr(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    try {
+      await api("/api/brokers", {
+        method: "POST",
+        body: JSON.stringify({
+          broker: "ibkr",
+          label: ibkrLabel || (ibkrPaper ? "IBKR Paper" : "IBKR"),
+          ibkr: {
+            access_token: ibkrAccessToken,
+            access_token_secret: ibkrAccessTokenSecret,
+            account_id: ibkrAccountId,
+            paper: ibkrPaper,
+          },
+        }),
+      });
+      setIbkrLabel(""); setIbkrAccessToken(""); setIbkrAccessTokenSecret(""); setIbkrAccountId("");
+      notify.success("IBKR connected — balance fetched");
+      await load();
+    } catch (e) {
+      notify.fromError(e, "IBKR connect failed");
     } finally {
       setBusy(false);
     }
@@ -99,9 +138,11 @@ export default function BrokersPage() {
       <h1 className="text-2xl font-semibold">Broker connections</h1>
 
       <p className="text-sm" style={{ color: "var(--muted)" }}>
-        Currently supported: <strong>Alpaca</strong>. Paper and live both work. Get your API keys from
-        the Alpaca dashboard (app.alpaca.markets). Keys never leave the server — they're encrypted
-        at rest with Fernet (AES-128).
+        Currently supported: <strong>Alpaca</strong> (production-ready) and{" "}
+        <strong>IBKR</strong> (pending validation against a real IBKR account — your
+        connect attempt will return 501 until your operator finishes IBKR's
+        third-party onboarding and sets the consumer-key env vars on the backend).
+        Keys never leave the server — they're encrypted at rest with Fernet (AES-128).
       </p>
 
       <section className="space-y-3">
@@ -175,7 +216,37 @@ export default function BrokersPage() {
         </div>
       </section>
 
-      {accounts.some(a => a.broker === "alpaca") ? null : (
+      {/* Broker selector — shown above whichever connect form is active. */}
+      <section className="space-y-3">
+        <div className="flex gap-2">
+          {(["alpaca", "ibkr"] as const).map((b) => {
+            const active = brokerType === b;
+            const alreadyConnected = accounts.some(a => a.broker === b);
+            return (
+              <button
+                key={b}
+                type="button"
+                onClick={() => setBrokerType(b)}
+                disabled={alreadyConnected}
+                title={alreadyConnected ? `${b.toUpperCase()} is already connected` : undefined}
+                className="px-4 py-2 text-sm font-medium rounded transition-colors"
+                style={{
+                  border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
+                  background: active ? "rgba(10,115,168,0.16)" : "transparent",
+                  color: alreadyConnected ? "var(--muted)" : active ? "var(--accent)" : "var(--text-2)",
+                  opacity: alreadyConnected ? 0.5 : 1,
+                  cursor: alreadyConnected ? "not-allowed" : "pointer",
+                }}
+              >
+                {b === "alpaca" ? "Alpaca" : "Interactive Brokers"}
+                {alreadyConnected && " ✓"}
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {brokerType === "alpaca" && !accounts.some(a => a.broker === "alpaca") && (
       <section className="card p-5 space-y-4 max-w-lg">
         <h2 className="font-semibold">Connect an Alpaca account</h2>
         <p className="text-xs" style={{ color: "var(--muted)" }}>
@@ -198,6 +269,56 @@ export default function BrokersPage() {
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={paper} onChange={e => setPaper(e.target.checked)} />
             <span>Paper-trading account (recommended for testing)</span>
+          </label>
+          <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
+            <span>Connect</span>
+            {busy && <Spinner />}
+          </button>
+        </form>
+      </section>
+      )}
+
+      {brokerType === "ibkr" && !accounts.some(a => a.broker === "ibkr") && (
+      <section className="card p-5 space-y-4 max-w-lg">
+        <h2 className="font-semibold">Connect an Interactive Brokers account</h2>
+        <p className="text-xs" style={{ color: "var(--muted)" }}>
+          IBKR uses OAuth 1.0a. Your operator (the SignalBoxx admin) registers the
+          app with IBKR via{" "}
+          <a href="https://www.interactivebrokers.com/campus/ibkr-api-page/oauth-1-0a-extended/" target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--accent)" }}>IBKR's third-party API onboarding</a>.
+          You authorize the app against your account and paste the resulting
+          access token + secret here. Your account ID is the one starting with
+          a letter (e.g. <code>U1234567</code>).
+        </p>
+        <div
+          className="text-xs px-3 py-2 rounded border"
+          style={{ borderColor: "var(--border)", background: "rgba(217, 119, 6, 0.08)", color: "var(--text-2)" }}
+        >
+          <strong>Pending validation:</strong> the adapter shell is in place but
+          hasn't been tested end-to-end against a real IBKR account yet. Connect
+          attempts will succeed only after the backend operator has set the
+          IBKR consumer-key + signing-PEM env vars (see
+          <code className="ml-1">doc/DEPLOY.md</code>).
+        </div>
+        <form onSubmit={connectIbkr} className="space-y-3">
+          <div>
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Label (optional)</label>
+            <input className="w-full p-2" placeholder="IBKR" value={ibkrLabel} onChange={e => setIbkrLabel(e.target.value)} />
+          </div>
+          <div>
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Account ID</label>
+            <input className="w-full p-2 font-mono text-sm" placeholder="U1234567" value={ibkrAccountId} onChange={e => setIbkrAccountId(e.target.value)} required />
+          </div>
+          <div>
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Access token</label>
+            <input className="w-full p-2 font-mono text-sm" placeholder="OAuth access token" value={ibkrAccessToken} onChange={e => setIbkrAccessToken(e.target.value)} required />
+          </div>
+          <div>
+            <label className="text-[11px] uppercase tracking-wider mb-1 block" style={{ color: "var(--muted)" }}>Access token secret</label>
+            <input className="w-full p-2 font-mono text-sm" type="password" placeholder="OAuth access token secret" value={ibkrAccessTokenSecret} onChange={e => setIbkrAccessTokenSecret(e.target.value)} required />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={ibkrPaper} onChange={e => setIbkrPaper(e.target.checked)} />
+            <span>Paper-trading account (IBKR paper logins start with <code>DU</code>)</span>
           </label>
           <button disabled={busy} className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2">
             <span>Connect</span>

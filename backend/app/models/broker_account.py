@@ -12,8 +12,10 @@ from app.models.base import Base, TimestampMixin
 
 class BrokerName(str, enum.Enum):
     """Brokers we directly integrate with. Adding a new one means writing an
-    adapter under app/brokers/."""
+    adapter under app/brokers/ AND an alembic migration that ALTERs the
+    Postgres broker_name enum (see e7c4a9b21d83_add_ibkr_to_broker_name_enum)."""
     ALPACA = "alpaca"
+    IBKR = "ibkr"
 
 
 class BrokerAccount(Base, TimestampMixin):

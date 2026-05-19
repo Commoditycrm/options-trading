@@ -39,6 +39,23 @@ def _credentials_for(payload: ConnectBrokerIn) -> dict[str, Any]:
             if not payload.alpaca:
                 raise HTTPException(422, "alpaca credentials required")
             return payload.alpaca.model_dump()
+        case BrokerName.IBKR:
+            if not payload.ibkr:
+                raise HTTPException(422, "ibkr credentials required")
+            # Pre-flight: app-level IBKR signing config must be present
+            # before any per-user connect can succeed. Surface a clear 501
+            # instead of letting the adapter blow up later with a less
+            # helpful message.
+            from app.config import get_settings
+            if not get_settings().ibkr_configured:
+                raise HTTPException(
+                    501,
+                    "ibkr_not_configured: backend missing IBKR_CONSUMER_KEY "
+                    "and/or IBKR_*_PEM env vars. Complete IBKR's third-party "
+                    "onboarding (webapionboarding@interactivebrokers.com) and "
+                    "set the env vars before connecting an IBKR account.",
+                )
+            return payload.ibkr.model_dump()
     raise HTTPException(422, "unknown broker")
 
 
@@ -46,12 +63,15 @@ def _refresh_balance_into(acct: BrokerAccount, creds: dict[str, Any]) -> None:
     """Best-effort. Errors are recorded into last_error, not raised."""
     try:
         adapter = adapter_for(acct, creds)
-        if isinstance(adapter, AlpacaAdapter):
+        # Both AlpacaAdapter and IbkrAdapter expose get_balance_snapshot.
+        # Use hasattr rather than isinstance so future adapters work
+        # without editing this function.
+        if hasattr(adapter, "get_balance_snapshot"):
             bal = adapter.get_balance_snapshot()
-            acct.cash = bal["cash"]
-            acct.buying_power = bal["buying_power"]
-            acct.total_equity = bal["total_equity"]
-            acct.currency = bal["currency"]
+            acct.cash = bal.get("cash")
+            acct.buying_power = bal.get("buying_power")
+            acct.total_equity = bal.get("total_equity")
+            acct.currency = bal.get("currency")
             acct.balance_updated_at = datetime.now(timezone.utc)
     except Exception as exc:  # noqa: BLE001
         acct.last_error = f"balance fetch failed: {str(exc)[:400]}"

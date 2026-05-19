@@ -6,6 +6,7 @@ from app.brokers.base import (
     BrokerPosition,
     ConnectionInfo,
 )
+from app.brokers.ibkr import IbkrAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
 
 
@@ -13,6 +14,8 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
     """Construct an adapter for the broker_account using its decrypted credentials."""
     if broker_account.broker == BrokerName.ALPACA:
         return AlpacaAdapter(credentials)
+    if broker_account.broker == BrokerName.IBKR:
+        return IbkrAdapter(credentials)
     raise ValueError(f"no adapter for {broker_account.broker}")
 
 
@@ -23,6 +26,7 @@ __all__ = [
     "BrokerOrderResult",
     "BrokerPosition",
     "ConnectionInfo",
+    "IbkrAdapter",
     "adapter_for",
     "build_occ_symbol",
 ]

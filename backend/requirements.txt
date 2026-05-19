@@ -12,4 +12,5 @@ python-multipart==0.0.12
 cryptography==43.0.3
 httpx==0.27.2
 alpaca-py==0.33.0
+ibind==0.1.23
 python-dateutil==2.9.0
