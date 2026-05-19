@@ -130,6 +130,19 @@ export default function TradesPage() {
       return;
     }
     const incoming = evt.order;
+    // With async order placement, the broker's rejection arrives via
+    // order.updated rather than as the HTTP response. Surface it as a toast
+    // so the trader doesn't miss the failure (otherwise they'd only notice
+    // the red status pill on the row).
+    if (
+      (evt.type === "order.updated" || evt.type === "order.copy_failed") &&
+      incoming.status === "rejected"
+    ) {
+      notify.fromError(
+        new Error(incoming.reject_reason ?? "Broker rejected the order"),
+        `Order rejected: ${incoming.symbol}`,
+      );
+    }
     setOrders((cur) => {
       const idx = cur.findIndex((o) => o.id === incoming.id);
       const merged: Order = {

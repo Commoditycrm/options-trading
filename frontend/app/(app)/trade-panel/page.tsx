@@ -371,10 +371,16 @@ export default function TradePanelPage() {
         method: "POST", body: JSON.stringify(body),
       });
       setLast(res);
+      // The order is sent to the broker asynchronously now — the response is
+      // a PENDING placeholder. The trade-update SSE stream will push the
+      // actual broker state (submitted / filled / rejected) via order.updated,
+      // which the global rejection toast + the positions/trades pages already
+      // react to. Don't echo res.status here since "pending" reads wrong.
       notify.success(
-        `${useSide.toUpperCase()} ${qty} ${symbol.toUpperCase()} (${useType.replace("_", "-")}) — ${res.status}`
+        `${useSide.toUpperCase()} ${qty} ${symbol.toUpperCase()} (${useType.replace("_", "-")}) sent`
       );
-      // Refresh the embedded positions table so a new fill appears below.
+      // SSE-driven refresh handles this too, but call explicitly so the
+      // positions row appears even if the user disconnected from the stream.
       positionsRef.current?.refresh();
     } catch (e) {
       notify.fromError(e, "Order placement failed");

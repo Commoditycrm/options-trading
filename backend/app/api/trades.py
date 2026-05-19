@@ -148,29 +148,113 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
-def _run_fanout_in_background(trader_order_id: uuid.UUID, trader_id: uuid.UUID) -> None:
-    """Runs after the response is sent. Opens its own DB session because the
-    request-scoped session is closed by the time this fires."""
+def _submit_to_broker_in_background(
+    order_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    will_fanout: bool,
+    ip_address: str | None,
+) -> None:
+    """Runs after the HTTP response. Sends the already-persisted order to the
+    broker, updates its status from the broker response, publishes
+    order.updated SSE so the UI flips from pending → submitted/filled/rejected,
+    and (only if the broker accepted) fans out to subscribers.
+
+    Why this lives off the request:
+      The synchronous adapter.place_order() call to a broker takes 100-600ms
+      typical. Doing it inline made the trader's BUY/SELL click feel sluggish.
+      With the trade-update stream already pushing fills via order.updated,
+      we can return the PENDING row instantly and let the UI heal itself.
+
+    Fanout sequencing:
+      Subscribers should NOT mirror a trader order that the broker rejected.
+      Running fanout inside the same task — after a successful broker submit —
+      guarantees the rejection path skips fanout entirely.
+    """
     with SessionLocal() as db:
-        order = db.get(Order, trader_order_id)
-        trader = db.get(User, trader_id)
-        if order is None or trader is None:
+        order = db.get(Order, order_id)
+        if order is None:
             return
-        fan_results = copy_engine.fanout(db, order, trader)
+        actor = db.get(User, actor_id)
+        if actor is None:
+            return
+        acct = db.get(BrokerAccount, order.broker_account_id)
+        if acct is None:
+            # Account was deleted between the request and this background task
+            # firing. Mark rejected so the UI doesn't keep the row in "pending".
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = "broker_account_missing"
+            order.closed_at = datetime.now(timezone.utc)
+            db.commit()
+            db.refresh(order)
+            events.publish(actor.id, copy_engine._order_event("order.updated", order))
+            return
+
+        try:
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter = adapter_for(acct, creds)
+            result = adapter.place_order(
+                BrokerOrderRequest(
+                    instrument_type=order.instrument_type,
+                    symbol=order.symbol,
+                    side=order.side,
+                    order_type=order.order_type,
+                    quantity=order.quantity,
+                    limit_price=order.limit_price,
+                    stop_price=order.stop_price,
+                    option_expiry=order.option_expiry,
+                    option_strike=order.option_strike,
+                    option_right=order.option_right,
+                    client_order_id=str(order.id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            order.status = OrderStatus.REJECTED
+            order.reject_reason = str(exc)[:480]
+            order.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db, actor_user_id=actor.id, action="trader.order_rejected_at_broker",
+                entity_type="order", entity_id=order.id,
+                metadata={"error": str(exc)[:480]}, ip_address=ip_address,
+            )
+            db.commit()
+            db.refresh(order)
+            events.publish(actor.id, copy_engine._order_event("order.updated", order))
+            return
+
+        order.broker_order_id = result.broker_order_id
+        order.status = result.status
+        order.submitted_at = result.submitted_at
+        order.filled_quantity = result.filled_quantity
+        order.filled_avg_price = result.filled_avg_price
         audit.record(
-            db,
-            actor_user_id=trader.id,
-            action="trader.fanout_complete",
-            entity_type="order",
-            entity_id=order.id,
+            db, actor_user_id=actor.id, action="trader.order_placed",
+            entity_type="order", entity_id=order.id,
             metadata={
-                "subscriber_count": len({r.subscriber_user_id for r in fan_results}),
-                "submitted": sum(1 for r in fan_results if r.status == "submitted"),
-                "errors": sum(1 for r in fan_results if r.status == "error"),
-                "skipped": sum(1 for r in fan_results if r.status.startswith("skipped")),
+                "broker": acct.broker.value, "symbol": order.symbol, "side": order.side.value,
+                "qty": str(order.quantity), "broker_order_id": result.broker_order_id,
             },
+            ip_address=ip_address,
         )
         db.commit()
+        db.refresh(order)
+        events.publish(actor.id, copy_engine._order_event("order.updated", order))
+
+        if will_fanout:
+            fan_results = copy_engine.fanout(db, order, actor)
+            audit.record(
+                db,
+                actor_user_id=actor.id,
+                action="trader.fanout_complete",
+                entity_type="order",
+                entity_id=order.id,
+                metadata={
+                    "subscriber_count": len({r.subscriber_user_id for r in fan_results}),
+                    "submitted": sum(1 for r in fan_results if r.status == "submitted"),
+                    "errors": sum(1 for r in fan_results if r.status == "error"),
+                    "skipped": sum(1 for r in fan_results if r.status.startswith("skipped")),
+                },
+            )
+            db.commit()
 
 
 def _place_trader_order(
@@ -187,8 +271,17 @@ def _place_trader_order(
     for subscriber-originated closes — in that case we skip the trader
     kill-switch check and don't fan anything out.
 
-    Returns the persisted Order. Caller commits nothing — this function
-    commits before returning.
+    Returns the persisted Order at status=PENDING. The actual broker submission
+    runs as a background task — the trade-update SSE stream pushes the result
+    (order.updated) so the UI flips to SUBMITTED/FILLED/REJECTED on its own
+    within ~100-600ms. This keeps the HTTP response ~10ms instead of blocking
+    on the broker round-trip.
+
+    Pre-flight validation (kill switch, broker account exists / connected) still
+    runs synchronously so misconfiguration raises 4xx immediately — only the
+    happy path is deferred.
+
+    Caller commits nothing — this function commits before returning.
     """
     is_trader = trader.role == UserRole.TRADER
     # Trader kill switch only applies to traders. Subscribers can always
@@ -201,7 +294,6 @@ def _place_trader_order(
         raise HTTPException(404, "broker_account_not_found")
     if acct.connection_status != "connected":
         raise HTTPException(409, "broker_not_connected")
-    creds = decrypt_json(acct.encrypted_credentials)
 
     # Will this order be broadcast to subscribers? Pre-compute so we can
     # stamp the flag on the row at creation time (immutable record of intent).
@@ -226,64 +318,21 @@ def _place_trader_order(
         fanned_out_to_subscribers=will_fanout,
     )
     db.add(order)
-    db.flush()
-
-    adapter = adapter_for(acct, creds)
-    try:
-        result = adapter.place_order(
-            BrokerOrderRequest(
-                instrument_type=order.instrument_type,
-                symbol=order.symbol,
-                side=order.side,
-                order_type=order.order_type,
-                quantity=order.quantity,
-                limit_price=order.limit_price,
-                stop_price=order.stop_price,
-                option_expiry=order.option_expiry,
-                option_strike=order.option_strike,
-                option_right=order.option_right,
-                client_order_id=str(order.id),
-            )
-        )
-    except Exception as exc:  # noqa: BLE001
-        order.status = OrderStatus.REJECTED
-        order.reject_reason = str(exc)[:480]
-        order.closed_at = datetime.now(timezone.utc)
-        audit.record(
-            db, actor_user_id=trader.id, action="trader.order_rejected_at_broker",
-            entity_type="order", entity_id=order.id,
-            metadata={"error": str(exc)[:480]}, ip_address=client_ip(request),
-        )
-        db.commit()
-        raise HTTPException(502, f"broker_error: {exc}")
-
-    order.broker_order_id = result.broker_order_id
-    order.status = result.status
-    order.submitted_at = result.submitted_at
-    order.filled_quantity = result.filled_quantity
-    order.filled_avg_price = result.filled_avg_price
-
-    audit.record(
-        db, actor_user_id=trader.id, action="trader.order_placed",
-        entity_type="order", entity_id=order.id,
-        metadata={
-            "broker": acct.broker, "symbol": order.symbol, "side": order.side.value,
-            "qty": str(order.quantity), "broker_order_id": result.broker_order_id,
-        },
-        ip_address=client_ip(request),
-    )
-
     db.commit()
     db.refresh(order)
 
     events.publish(trader.id, copy_engine._order_event("order.placed", order))
-    # Only trader-originated orders fan out to subscribers. Subscribers placing
-    # their own close don't propagate to anyone. Callers (e.g. close-all with
-    # "mine only" scope) can also opt out via skip_fanout. The trader's master
-    # pause is also checked at the start of fanout itself — we record the
-    # intended-fanout flag (`will_fanout`) on the order row above.
-    if will_fanout:
-        background.add_task(_run_fanout_in_background, order.id, trader.id)
+
+    # Defer the broker submission AND the fanout to the background task. Fanout
+    # is chained inside the task so subscribers don't mirror a trader order the
+    # broker rejected.
+    background.add_task(
+        _submit_to_broker_in_background,
+        order.id,
+        trader.id,
+        will_fanout,
+        client_ip(request),
+    )
     return order
 
 

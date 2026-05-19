@@ -114,6 +114,18 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
         evt.type !== "order.cancelled" &&
         evt.type !== "order.updated"
       ) return;
+      // With async order placement, broker rejections arrive here rather than
+      // as the HTTP response from /api/trades. Surface them as a toast so the
+      // trader knows immediately, not just from a red pill on the table.
+      if (
+        (evt.type === "order.updated" || evt.type === "order.copy_failed") &&
+        evt.order.status === "rejected"
+      ) {
+        notify.fromError(
+          new Error(evt.order.reject_reason ?? "Broker rejected the order"),
+          `Order rejected: ${evt.order.symbol}`,
+        );
+      }
       if (ssEventTimer.current) clearTimeout(ssEventTimer.current);
       ssEventTimer.current = setTimeout(() => { refresh(); }, 800);
     });
