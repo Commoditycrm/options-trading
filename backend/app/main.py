@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import auth, brokers, events, options, positions, settings, subscribers, trades
 from app.config import get_settings
+from app.services import alpaca_stream
 from app.services import events as events_bus
 
 DISCLAIMER = (
@@ -42,6 +43,17 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def _bind_loop() -> None:
         events_bus.bind_loop(asyncio.get_running_loop())
+
+    @app.on_event("startup")
+    async def _start_alpaca_streams() -> None:
+        # Real-time trade-update WebSocket per connected Alpaca account.
+        # Fills land in the DB + SSE within ~100ms of execution instead of
+        # waiting for the frontend to poll sync-fills.
+        await alpaca_stream.start_all_streams()
+
+    @app.on_event("shutdown")
+    async def _stop_alpaca_streams() -> None:
+        await alpaca_stream.stop_all_streams()
 
     @app.get("/api/health")
     def health() -> dict:

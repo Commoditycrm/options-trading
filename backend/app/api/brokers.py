@@ -27,7 +27,7 @@ from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.user import User
 from app.schemas.broker import BrokerAccountOut, ConnectBrokerIn
-from app.services import audit
+from app.services import alpaca_stream, audit
 from app.services.crypto import decrypt_json, encrypt_json
 
 router = APIRouter(prefix="/api/brokers", tags=["brokers"])
@@ -106,6 +106,15 @@ def connect(
     )
     db.commit()
     db.refresh(acct)
+
+    # Open the real-time order-update WebSocket for this account so fills
+    # land in the DB + SSE immediately. Best-effort: a stream failure must
+    # NOT roll back the successful connection.
+    if acct.broker == BrokerName.ALPACA:
+        try:
+            alpaca_stream.start_stream(acct.id)
+        except Exception:  # noqa: BLE001
+            pass
     return acct
 
 
@@ -157,5 +166,8 @@ def delete_broker(
         metadata={"broker": acct.broker.value, "label": acct.label},
         ip_address=client_ip(request),
     )
+    # Close the trade-update stream before dropping the row.
+    if acct.broker == BrokerName.ALPACA:
+        alpaca_stream.stop_stream(acct.id)
     db.delete(acct)
     db.commit()

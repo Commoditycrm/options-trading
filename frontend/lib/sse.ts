@@ -7,7 +7,12 @@ export type AppEvent =
   | { type: "order.placed"; order: OrderEventPayload }
   | { type: "order.copy_submitted"; order: OrderEventPayload }
   | { type: "order.copy_failed"; order: OrderEventPayload }
-  | { type: "order.cancelled"; order: OrderEventPayload };
+  | { type: "order.cancelled"; order: OrderEventPayload }
+  // Pushed by the Alpaca trade-update WebSocket whenever the broker changes
+  // an order's state (fill / partial_fill / accepted / rejected / expired /
+  // canceled). Lets the UI reflect fills in real time instead of waiting
+  // for the next sync-fills poll.
+  | { type: "order.updated"; order: OrderEventPayload };
 
 export interface OrderEventPayload {
   id: string;

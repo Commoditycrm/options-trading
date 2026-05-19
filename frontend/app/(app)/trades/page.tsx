@@ -77,10 +77,11 @@ export default function TradesPage() {
   const [actingFor, setActingFor] = useState<{ id: string; kind: "cancel" | "market" | "limit" } | null>(null);
   // Per-row limit-price input for the inline "Close at Limit" action.
   const [closePrices, setClosePrices] = useState<Record<string, string>>({});
-  // Coalesce SSE-triggered sync-fills + reload. SSE delivers a mirror order
-  // moments before Alpaca fills it; without a follow-up sync the row sits at
-  // "submitted" forever (and shows a misleading Cancel button) until you
-  // refresh manually.
+  // Reconciliation fallback. Now that the Alpaca trade-update stream pushes
+  // `order.updated` events directly, the row should normally transition from
+  // SUBMITTED → FILLED without any extra round-trip. We keep a longer-delay
+  // sync-fills fallback in case the stream missed an event (network blip,
+  // app restart between submit and fill) so the UI eventually heals itself.
   const reconcileTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -123,7 +124,8 @@ export default function TradesPage() {
       evt.type !== "order.placed" &&
       evt.type !== "order.copy_submitted" &&
       evt.type !== "order.copy_failed" &&
-      evt.type !== "order.cancelled"
+      evt.type !== "order.cancelled" &&
+      evt.type !== "order.updated"
     ) {
       return;
     }
@@ -162,10 +164,11 @@ export default function TradesPage() {
     setFlashId(incoming.id);
     setTimeout(() => setFlashId((f) => (f === incoming.id ? null : f)), 2000);
 
-    // If the incoming order isn't terminal yet (e.g. a fresh mirror sitting at
-    // SUBMITTED), the broker is likely about to fill it within milliseconds.
-    // Schedule a single sync-fills + reload to catch the real status. Coalesce
-    // repeated events into one round-trip.
+    // Fallback reconciliation. The trade-update stream normally pushes the
+    // fill event itself (as order.updated) within ms of execution, so this
+    // sync-fills + reload is rarely needed. We delay 5s (instead of the old
+    // 1.5s) so we don't slam the backend on every order — and skip entirely
+    // if the very event we just received already drove the row to terminal.
     const terminal = incoming.status === "filled" || incoming.status === "canceled" || incoming.status === "rejected";
     if (!terminal) {
       if (reconcileTimer.current) clearTimeout(reconcileTimer.current);
@@ -175,7 +178,7 @@ export default function TradesPage() {
           const fresh = await api<Order[]>("/api/trades");
           setOrders(fresh);
         } catch { /* ignore */ }
-      }, 1500);
+      }, 5000);
     }
   });
 

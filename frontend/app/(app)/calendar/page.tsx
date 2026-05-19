@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
+import { useEventStream } from "@/lib/sse";
 import type { DailyPnL, SubscriberSummary, User } from "@/lib/types";
 
 function startOfMonth(d: Date) { return new Date(d.getFullYear(), d.getMonth(), 1); }
@@ -75,6 +76,25 @@ export default function CalendarPage() {
   }, []);
 
   useEffect(() => { loadPnL(); }, [loadPnL]);
+
+  // Live refresh: when the trade-update stream pushes a fill (`order.updated`
+  // with a terminal status, or any order.cancelled), the day's realized P&L
+  // may have shifted — reload. Debounce to coalesce bursts. We only refresh
+  // when looking at our own P&L; trader-views-subscriber stays manual to
+  // avoid one trader's events triggering refetches across every open
+  // calendar tab.
+  const liveRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEventStream((evt) => {
+    if (viewingUserId) return;
+    if (evt.type !== "order.updated" && evt.type !== "order.cancelled") return;
+    // Only fills/cancels actually move P&L; skip the noise of acceptance
+    // events that don't change realized totals.
+    const s = evt.order.status;
+    if (s !== "filled" && s !== "partially_filled" && s !== "canceled") return;
+    if (liveRefreshTimer.current) clearTimeout(liveRefreshTimer.current);
+    liveRefreshTimer.current = setTimeout(() => { loadPnL(); }, 1200);
+  });
+  useEffect(() => () => { if (liveRefreshTimer.current) clearTimeout(liveRefreshTimer.current); }, []);
 
   const byDay = useMemo(() => {
     const m: Record<string, DailyPnL> = {};

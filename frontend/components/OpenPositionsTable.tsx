@@ -100,20 +100,22 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     useImperativeHandle(ref, () => ({ refresh }), [refresh]);
 
     // Real-time: any order event for this user (own placement, mirror from a
-    // followed trader, cancellation, etc.) is a reason to re-check positions.
-    // Debounce so a burst of fanout events fires one network round-trip, and
-    // give the broker a moment to actually fill before we ask for the
-    // post-fill state.
+    // followed trader, cancellation, fill pushed by the trade-update stream)
+    // is a reason to re-check positions. Debounce so a burst of fanout events
+    // fires one network round-trip. The 800ms delay is short enough that a
+    // fill arriving via order.updated visibly closes its position row almost
+    // immediately.
     const ssEventTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
     useEventStream((evt) => {
       if (
         evt.type !== "order.placed" &&
         evt.type !== "order.copy_submitted" &&
         evt.type !== "order.copy_failed" &&
-        evt.type !== "order.cancelled"
+        evt.type !== "order.cancelled" &&
+        evt.type !== "order.updated"
       ) return;
       if (ssEventTimer.current) clearTimeout(ssEventTimer.current);
-      ssEventTimer.current = setTimeout(() => { refresh(); }, 1500);
+      ssEventTimer.current = setTimeout(() => { refresh(); }, 800);
     });
     useEffect(() => () => { if (ssEventTimer.current) clearTimeout(ssEventTimer.current); }, []);
 
