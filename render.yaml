@@ -1,0 +1,72 @@
+# Render blueprint for the SignalBoxx backend.
+#
+# Frontend stays on Vercel (deployed via the existing vercel.json). This file
+# only provisions the FastAPI backend + Postgres on Render.
+#
+# Why Render instead of Vercel for the backend
+# --------------------------------------------
+# The backend holds long-lived state that serverless can't host: one Alpaca
+# (and soon IBKR) WebSocket per connected broker for live order/fill push,
+# plus per-user SSE streams for the frontend. Render runs the FastAPI process
+# as a long-running container — same shape it'll have on ECS/Fargate later.
+#
+# First-time setup
+# ----------------
+# 1. From the Render dashboard → New → Blueprint, point at this repo.
+# 2. CREDENTIAL_ENCRYPTION_KEY must be set manually after the service is
+#    created. Generate locally:
+#        python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#    Then add it via Render dashboard → Environment.
+#    DO NOT use Render's generateValue for this — Fernet needs a specific
+#    32-byte url-safe base64 format, not arbitrary random.
+# 3. CORS_ORIGINS and FRONTEND_BASE_URL default to the Vercel frontend URL
+#    below — change if your Vercel project name differs.
+#
+# After AWS migration
+# -------------------
+# This file becomes irrelevant. The same uvicorn command in the startCommand
+# below runs unchanged on ECS / Fargate / App Runner / EC2.
+
+services:
+  - type: web
+    name: signalboxx-backend
+    runtime: python
+    plan: free            # bump to "starter" ($7/mo) for always-on — free tier
+                          # spins down after 15min idle, dropping the Alpaca
+                          # trade-update WebSocket. Fine for dev; not for prod.
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    # alembic upgrade head runs on every deploy via preDeployCommand. The
+    # web service starts only after migrations succeed.
+    preDeployCommand: alembic upgrade head
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: signalboxx-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true        # 256-bit random base64; safe for HS256
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: JWT_ACCESS_TOKEN_MINUTES
+        value: "30"
+      - key: JWT_REFRESH_TOKEN_DAYS
+        value: "14"
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false                # MUST be set manually via dashboard
+                                   # (see "First-time setup" above)
+      - key: CORS_ORIGINS
+        value: https://copy-trading-app.vercel.app
+      - key: FRONTEND_BASE_URL
+        value: https://copy-trading-app.vercel.app
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+
+databases:
+  - name: signalboxx-db
+    plan: free               # 1GB, 90-day expiry on free tier — fine for dev,
+                             # upgrade to "starter" before going live.
+    databaseName: signalboxx
+    user: signalboxx

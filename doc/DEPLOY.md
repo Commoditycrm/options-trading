@@ -1,0 +1,70 @@
+# Deployment
+
+**Topology:** Frontend on Vercel, backend on Render (interim) → AWS ECS/Fargate (later). The backend code is the same on Render and AWS — only the host changes.
+
+## Why the backend isn't on Vercel
+
+Vercel runs Python as serverless functions. The backend holds state that serverless can't host:
+
+- One Alpaca (later IBKR) WebSocket per connected broker for live order/fill push
+- Per-user SSE streams kept open until the browser tab closes
+- FastAPI `BackgroundTasks` that submit orders to the broker asynchronously
+
+All three want a long-running process. Serverless gives us a process that lives ~one request and dies. The "fast, live, no delay" requirement needs a long-running host.
+
+Render (interim, free tier OK for dev) and AWS ECS/Fargate (later, production) both give us that. The same `uvicorn app.main:app` start command runs on both.
+
+## Render setup
+
+1. **From the Render dashboard:** New → Blueprint → connect this GitHub repo → Render auto-detects `render.yaml`.
+2. **After the service is created, set the Fernet key by hand.** `render.yaml` marks it `sync: false` so it isn't auto-generated (Render's `generateValue` doesn't produce a valid Fernet key shape). Generate locally and paste into Render → Environment:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set `CREDENTIAL_ENCRYPTION_KEY` to that value. **Never rotate this in place** — every encrypted broker credential in the DB will become unreadable.
+
+3. **Update `CORS_ORIGINS` and `FRONTEND_BASE_URL`** in `render.yaml` to match your actual Vercel URL (default assumes `copy-trading-app.vercel.app`).
+
+4. **Free tier limitation:** the service spins down after 15 minutes of inactivity. When it spins down, the Alpaca trade-update WebSocket dies and any open SSE connection drops. The next request wakes it (30+ second cold start) and the stream reconnects. **Bump to the Starter plan ($7/mo) before going live** — the always-on guarantee is what makes the streaming features work in production.
+
+## Vercel frontend setup
+
+1. **Existing `vercel.json` now points at the frontend only** — no more `@vercel/python` build, no `/api/*` rewrite to a local backend.
+2. **Set two env vars in the Vercel project:**
+
+   | Name | Value | Why |
+   |---|---|---|
+   | `BACKEND_URL` | `https://signalboxx-backend.onrender.com` | Used server-side by `next.config.js`'s rewrite, so the browser's `/api/*` calls proxy through Next.js to Render. Not exposed to the browser. |
+   | `NEXT_PUBLIC_API_BASE_URL` | `https://signalboxx-backend.onrender.com` | Exposed to the browser. Used **only by the SSE client (`lib/sse.ts`)** so the EventSource hits Render directly, bypassing Vercel's proxy (which would time out long connections at ~30–60s). |
+
+3. Redeploy the frontend. Test by opening the Trades page and confirming the SSE event stream stays connected past 60s (network tab → `/api/events` → "EventStream" should stay open).
+
+## Local dev
+
+Unchanged. `next.config.js` rewrites default to `http://localhost:8000`. Run the backend on port 8000, frontend on port 3000, no env vars needed. SSE works through the Next.js dev server's rewrite without timeout issues.
+
+## Migration to AWS later
+
+When the team is ready for AWS:
+
+- **ECS / Fargate / App Runner / EC2** — all long-running, all run `uvicorn app.main:app` unchanged. Pick whichever fits your infra.
+- **Avoid AWS Lambda** — same serverless problem as Vercel. Won't host the WebSocket / SSE / background-task pieces.
+- Postgres: migrate to RDS, update `DATABASE_URL`.
+- DNS: point the Render URL to the new AWS URL. Update `BACKEND_URL` and `NEXT_PUBLIC_API_BASE_URL` on Vercel.
+
+## Required env vars (reference)
+
+| Variable | Where | Notes |
+|---|---|---|
+| `DATABASE_URL` | backend | Postgres connection string. Render fills it automatically from `signalboxx-db`. |
+| `JWT_SECRET` | backend | 256-bit base64. Render generates it. **Never rotate in place** — invalidates all live sessions. |
+| `JWT_ALGORITHM` | backend | `HS256`. Don't change unless you've coordinated with the frontend. |
+| `JWT_ACCESS_TOKEN_MINUTES` | backend | `30` default. |
+| `JWT_REFRESH_TOKEN_DAYS` | backend | `14` default. |
+| `CREDENTIAL_ENCRYPTION_KEY` | backend | Fernet key. Set by hand (see above). **Never rotate** — invalidates every stored broker credential. |
+| `CORS_ORIGINS` | backend | Comma-separated. Must include the Vercel frontend URL. |
+| `FRONTEND_BASE_URL` | backend | Used in password-reset emails. |
+| `BACKEND_URL` | Vercel (server) | Render URL. Used by Next.js rewrites. |
+| `NEXT_PUBLIC_API_BASE_URL` | Vercel (browser) | Render URL. Used by EventSource. Required for live updates in production. |

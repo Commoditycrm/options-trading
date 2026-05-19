@@ -45,7 +45,13 @@ export function useEventStream(onEvent: (e: AppEvent) => void): void {
     const token = getAccessToken();
     if (!token) return;
 
-    const url = `/api/events?token=${encodeURIComponent(token)}`;
+    // EventSource must hit the backend DIRECTLY in production, NOT through
+    // the Next.js rewrite. On Vercel, rewrites proxy through the edge layer
+    // which cuts SSE connections at ~30-60s. Setting NEXT_PUBLIC_API_BASE_URL
+    // to the Render (or AWS) backend URL bypasses that. Empty default uses
+    // the rewrite — fine for local dev (Next dev server proxies cleanly).
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+    const url = `${apiBase}/api/events?token=${encodeURIComponent(token)}`;
     const es = new EventSource(url);
 
     es.onmessage = (msg) => {
