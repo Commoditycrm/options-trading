@@ -1,24 +1,33 @@
-"""Copy-trade fan-out (direct broker, parallel execution).
+"""Copy-trade fan-out — orchestration over a per-target unit of work.
 
-When the trader places an order, fan out to every active subscriber's broker
-account, scaled by their multiplier. Quantity rounding rule:
-  - If broker supports fractional shares: keep raw multiplied quantity (truncated to 6dp).
-  - Otherwise: floor to whole shares. If result is 0, skip and audit-log the skip.
+Two surfaces:
 
-Execution model:
-  Phase 1 (serial, fast): for each subscriber × broker_account, compute the
-                          scaled qty, insert a child Order row in PENDING state.
-  Phase 2 (parallel, slow): fire all broker calls concurrently in a thread
-                            pool. Each thread only does the HTTP call, no DB.
-  Phase 3 (serial): apply the broker responses back to the child Order rows
-                    and audit-log each result. Publish an SSE event per
-                    subscriber so their UI updates immediately.
+1. ``fanout(db, trader_order, trader)`` — in-process orchestrator. Enumerates
+   every subscriber × broker_account that should receive a mirror of this
+   trader's order and dispatches them through a ThreadPoolExecutor.
 
-A failure on one subscriber must NOT block the others — handled by per-task
-exception capture in Phase 2.
+2. ``process_one_fanout(trader_order_id, target)`` — atomic unit of work
+   for ONE (subscriber, broker_account). Opens its own DB session so it's
+   thread-safe AND can be called from a Redis-Streams worker process in a
+   separate container. Runs every gate (master pause, subscriber
+   copy_enabled, daily-loss kill switch, zero-quantity skip) so the
+   decision is made on fresh state at execution time — important for
+   queue-replay semantics where the dispatch happened seconds or minutes
+   before the worker picks the message up.
+
+The quantity-scaling rule
+-------------------------
+  - If broker supports fractional shares: keep raw multiplied quantity
+    (truncated to 6dp).
+  - Otherwise: floor to whole shares. If result is 0, skip + audit.
+
+A failure on one target must NOT block the others — handled by per-task
+exception capture in the orchestrator + a try/except shell inside
+process_one_fanout that swallows broker errors into a FanoutResult.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -29,7 +38,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.brokers import BrokerOrderRequest, BrokerOrderResult, adapter_for
+from app.brokers import BrokerOrderRequest, adapter_for
+from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings, TraderSettings
@@ -39,6 +49,8 @@ from app.services.crypto import decrypt_json
 from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
 from app.services.pnl import today_realized_pnl
 
+log = logging.getLogger(__name__)
+
 MAX_PARALLEL = 32
 
 
@@ -47,21 +59,25 @@ class FanoutResult:
     subscriber_user_id: uuid.UUID
     broker_account_id: uuid.UUID
     order_id: uuid.UUID | None
-    status: str       # "submitted" | "skipped_zero_qty" | "skipped_no_broker" | "error"
+    # "submitted" | "skipped_zero_qty" | "skipped_no_broker"
+    # "skipped_copy_disabled" | "skipped_daily_loss_limit"
+    # "skipped_master_paused" | "skipped_not_following"
+    # "skipped_trader_order_missing" | "error"
+    status: str
     detail: str | None = None
 
 
-@dataclass
-class _PendingMirror:
-    """Phase-1 output: a child Order row already inserted, plus a constructed
-    adapter ready to place. We resolve the adapter in phase 1 (one DB read for
-    credentials) so phase 2 can be pure parallel HTTP."""
-    child_order_id: uuid.UUID
+@dataclass(frozen=True)
+class FanoutTarget:
+    """One unit of fanout work — mirror a trader order to one subscriber on
+    one specific broker account. Serializable so a Redis Stream worker can
+    reconstruct it from the message payload."""
+
     subscriber_user_id: uuid.UUID
     broker_account_id: uuid.UUID
-    adapter: Any                                # BrokerAdapter, pre-built
-    request: BrokerOrderRequest
 
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
     raw = trader_qty * multiplier
@@ -77,23 +93,27 @@ def trader_can_trade(db: Session, trader: User) -> bool:
     return bool(settings and settings.trading_enabled)
 
 
-def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]:
-    """Mirror `trader_order` to all subscribers following this trader.
-    Caller commits the session."""
-    results: list[FanoutResult] = []
-    pending: list[_PendingMirror] = []
+def enumerate_fanout_targets(db: Session, trader_id: uuid.UUID) -> list[FanoutTarget]:
+    """Return every (subscriber, broker_account) pair that should receive
+    a mirror of an order from this trader, AT THIS MOMENT.
 
-    # Trader master pause — skip all fanout when set. Subscribers' own
-    # copy_enabled flags are unaffected; they just don't receive this trade.
-    ts = db.get(TraderSettings, trader.id)
+    - Honours trader master pause (returns [] when paused).
+    - Honours subscriber copy_enabled.
+    - Excludes subscribers with no broker account (they'll be audit-logged
+      by process_one_fanout when called against an empty target list, but
+      we don't manufacture phantom targets here).
+
+    Does NOT check daily-loss limit — that check is done at processing time
+    so the freshest realized-P&L number is used. Same for zero-qty skip.
+    """
+    ts = db.get(TraderSettings, trader_id)
     if ts is not None and ts.copy_paused:
-        return results
+        return []
 
-    # ── Phase 1: build child orders + skip records ─────────────────────────
     sub_rows = (
         db.execute(
             select(SubscriberSettings).where(
-                SubscriberSettings.following_trader_id == trader.id,
+                SubscriberSettings.following_trader_id == trader_id,
                 SubscriberSettings.copy_enabled.is_(True),
             )
         )
@@ -101,208 +121,368 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
         .all()
     )
 
+    targets: list[FanoutTarget] = []
     for sub_settings in sub_rows:
-        sub_user = db.get(User, sub_settings.user_id)
-        if not sub_user:
-            continue
-
-        # Daily-loss kill switch: if today's realized loss already exceeds the
-        # subscriber's limit, flip copy off and skip. We check BEFORE placing
-        # the order so we never blow past the limit even by one trade.
-        if sub_settings.daily_loss_limit is not None:
-            todays_pnl = today_realized_pnl(db, sub_settings.user_id)
-            if todays_pnl <= -sub_settings.daily_loss_limit:
-                sub_settings.copy_enabled = False
-                audit.record(
-                    db,
-                    actor_user_id=sub_settings.user_id,
-                    action="copy.auto_paused_daily_loss",
-                    entity_type="subscriber_settings",
-                    entity_id=sub_settings.user_id,
-                    metadata={
-                        "daily_loss_limit": str(sub_settings.daily_loss_limit),
-                        "todays_realized_pnl": str(todays_pnl),
-                        "trigger_order_id": str(trader_order.id),
-                    },
-                )
-                events.publish(sub_settings.user_id, {
-                    "type": "copy.auto_paused",
-                    "reason": "daily_loss_limit",
-                    "daily_loss_limit": str(sub_settings.daily_loss_limit),
-                    "todays_realized_pnl": str(todays_pnl),
-                })
-                results.append(FanoutResult(
-                    subscriber_user_id=sub_settings.user_id,
-                    broker_account_id=uuid.UUID(int=0),
-                    order_id=None,
-                    status="skipped_daily_loss_limit",
-                ))
-                continue
-
         sub_accounts = (
             db.execute(
-                select(BrokerAccount).where(BrokerAccount.user_id == sub_settings.user_id)
+                select(BrokerAccount.id).where(BrokerAccount.user_id == sub_settings.user_id)
             )
             .scalars()
             .all()
         )
         if not sub_accounts:
-            results.append(FanoutResult(
+            # The subscriber is following + has copy enabled but has no broker
+            # connected. Surface as a result via process_one_fanout when its
+            # session sees the same empty state. We emit one synthetic target
+            # with a sentinel broker_account_id so the caller still gets a
+            # FanoutResult row for visibility.
+            targets.append(FanoutTarget(
                 subscriber_user_id=sub_settings.user_id,
                 broker_account_id=uuid.UUID(int=0),
-                order_id=None,
-                status="skipped_no_broker",
             ))
             continue
-
-        for acct in sub_accounts:
-            scaled = _scale_quantity(
-                trader_order.quantity, sub_settings.multiplier, acct.supports_fractional
-            )
-            if scaled <= 0:
-                audit.record(
-                    db,
-                    actor_user_id=sub_settings.user_id,
-                    action="copy.skipped_zero_qty",
-                    entity_type="order",
-                    entity_id=trader_order.id,
-                    metadata={
-                        "trader_qty": str(trader_order.quantity),
-                        "multiplier": str(sub_settings.multiplier),
-                        "broker_account_id": str(acct.id),
-                    },
-                )
-                results.append(FanoutResult(
-                    subscriber_user_id=sub_settings.user_id,
-                    broker_account_id=acct.id,
-                    order_id=None,
-                    status="skipped_zero_qty",
-                ))
-                continue
-
-            child = Order(
-                user_id=sub_settings.user_id,
-                broker_account_id=acct.id,
-                parent_order_id=trader_order.id,
-                instrument_type=trader_order.instrument_type,
-                symbol=trader_order.symbol,
-                option_expiry=trader_order.option_expiry,
-                option_strike=trader_order.option_strike,
-                option_right=trader_order.option_right,
-                side=trader_order.side,
-                order_type=trader_order.order_type,
-                quantity=scaled,
-                limit_price=trader_order.limit_price,
-                stop_price=trader_order.stop_price,
-                status=OrderStatus.PENDING,
-            )
-            db.add(child)
-            db.flush()
-
-            try:
-                sub_creds = decrypt_json(acct.encrypted_credentials)
-                sub_adapter = adapter_for(acct, sub_creds)
-            except Exception as exc:  # noqa: BLE001
-                child.status = OrderStatus.REJECTED
-                child.reject_reason = f"credentials_error: {exc}"[:480]
-                child.closed_at = datetime.now(timezone.utc)
-                results.append(FanoutResult(
-                    subscriber_user_id=sub_settings.user_id,
-                    broker_account_id=acct.id,
-                    order_id=child.id,
-                    status="error",
-                    detail=str(exc)[:200],
-                ))
-                continue
-
-            pending.append(_PendingMirror(
-                child_order_id=child.id,
+        for acct_id in sub_accounts:
+            targets.append(FanoutTarget(
                 subscriber_user_id=sub_settings.user_id,
-                broker_account_id=acct.id,
-                adapter=sub_adapter,
-                request=BrokerOrderRequest(
-                    instrument_type=child.instrument_type,
-                    symbol=child.symbol,
-                    side=child.side,
-                    order_type=child.order_type,
-                    quantity=child.quantity,
-                    limit_price=child.limit_price,
-                    stop_price=child.stop_price,
-                    option_expiry=child.option_expiry,
-                    option_strike=child.option_strike,
-                    option_right=child.option_right,
-                    client_order_id=str(child.id),
-                ),
+                broker_account_id=acct_id,
             ))
+    return targets
 
-    # ── Phase 2: fire all broker calls in parallel ─────────────────────────
-    # Uses place_order_with_recovery so transient broker errors auto-retry and
-    # user-fixable errors (after-hours market order, expired option, etc.)
-    # surface a clean reject_reason to the subscriber instead of raw 4xx text.
-    def _place(item: _PendingMirror) -> tuple[_PendingMirror, BrokerOrderResult | None, str | None]:
+
+# ─── The atomic unit of work ────────────────────────────────────────────────
+
+def process_one_fanout(
+    trader_order_id: uuid.UUID,
+    target: FanoutTarget,
+) -> FanoutResult:
+    """Mirror one trader order to one subscriber's one broker account.
+
+    Self-contained: opens its own DB session, commits before returning, and
+    captures all broker errors into a FanoutResult so callers (whether
+    in-process ThreadPoolExecutor or a Redis Streams worker) never have to
+    catch exceptions from it.
+
+    Gate order (matches the audit story):
+      1. trader_order exists                  → skipped_trader_order_missing
+      2. subscriber has settings              → skipped_copy_disabled
+      3. subscriber.copy_enabled is True      → skipped_copy_disabled
+      4. subscriber still follows the trader  → skipped_not_following
+      5. trader.copy_paused is False          → skipped_master_paused
+      6. daily_loss_limit not yet breached    → skipped_daily_loss_limit
+         (and auto-flips copy_enabled to False as a side effect)
+      7. subscriber has the broker_account    → skipped_no_broker
+      8. scaled quantity > 0                  → skipped_zero_qty
+
+    Then: place order via broker (with retry/recovery), update child Order
+    row, audit + SSE publish.
+    """
+    with SessionLocal() as db:
         try:
-            return item, place_order_with_recovery(item.adapter, item.request), None
-        except RecoverableOrderError as rec:
-            return item, None, rec.friendly_message[:480]
+            return _process_one_fanout_inner(db, trader_order_id, target)
         except Exception as exc:  # noqa: BLE001
-            return item, None, str(exc)[:480]
+            # Last-ditch safety net — should be unreachable because the inner
+            # function captures broker errors itself. If it fires, the worker
+            # still gets a FanoutResult instead of an exception propagating.
+            log.exception(
+                "copy_engine: unhandled exception in process_one_fanout "
+                "trader_order=%s subscriber=%s broker_account=%s",
+                trader_order_id, target.subscriber_user_id, target.broker_account_id,
+            )
+            db.rollback()
+            return FanoutResult(
+                subscriber_user_id=target.subscriber_user_id,
+                broker_account_id=target.broker_account_id,
+                order_id=None,
+                status="error",
+                detail=str(exc)[:200],
+            )
 
-    if pending:
-        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(pending))) as pool:
-            broker_results = list(pool.map(_place, pending))
-    else:
-        broker_results = []
 
-    # ── Phase 3: apply results, audit, publish events ──────────────────────
-    for item, resp, err in broker_results:
-        child = db.get(Order, item.child_order_id)
-        if resp is not None:
-            child.status = resp.status
-            child.broker_order_id = resp.broker_order_id
-            child.submitted_at = resp.submitted_at
-            child.filled_quantity = resp.filled_quantity
-            child.filled_avg_price = resp.filled_avg_price
+def _process_one_fanout_inner(
+    db: Session,
+    trader_order_id: uuid.UUID,
+    target: FanoutTarget,
+) -> FanoutResult:
+    """Real body of process_one_fanout. Split out so the outer wrapper can
+    do the exception-safety + session-lifecycle bookkeeping."""
+
+    trader_order = db.get(Order, trader_order_id)
+    if trader_order is None:
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_trader_order_missing",
+        )
+
+    sub_settings = db.get(SubscriberSettings, target.subscriber_user_id)
+    if sub_settings is None or not sub_settings.copy_enabled:
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_copy_disabled",
+        )
+
+    # Subscriber may have unfollowed between dispatch and processing.
+    if sub_settings.following_trader_id != trader_order.user_id:
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_not_following",
+        )
+
+    # Trader's master pause flag (may have flipped between dispatch and now).
+    ts = db.get(TraderSettings, trader_order.user_id)
+    if ts is not None and ts.copy_paused:
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_master_paused",
+        )
+
+    # Daily-loss kill switch. We check BEFORE placing so we never blow past
+    # the limit by one trade. On trip: flip copy_enabled off + SSE event so
+    # the subscriber's UI reflects the auto-pause immediately.
+    if sub_settings.daily_loss_limit is not None:
+        todays_pnl = today_realized_pnl(db, sub_settings.user_id)
+        if todays_pnl <= -sub_settings.daily_loss_limit:
+            sub_settings.copy_enabled = False
             audit.record(
                 db,
-                actor_user_id=item.subscriber_user_id,
-                action="copy.submitted",
-                entity_type="order",
-                entity_id=child.id,
+                actor_user_id=sub_settings.user_id,
+                action="copy.auto_paused_daily_loss",
+                entity_type="subscriber_settings",
+                entity_id=sub_settings.user_id,
                 metadata={
-                    "parent_order_id": str(trader_order.id),
-                    "broker_order_id": resp.broker_order_id,
-                    "scaled_qty": str(child.quantity),
+                    "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                    "todays_realized_pnl": str(todays_pnl),
+                    "trigger_order_id": str(trader_order.id),
                 },
             )
-            results.append(FanoutResult(
-                subscriber_user_id=item.subscriber_user_id,
-                broker_account_id=item.broker_account_id,
-                order_id=child.id,
-                status="submitted",
-            ))
-            events.publish(item.subscriber_user_id, _order_event("order.copy_submitted", child))
-        else:
-            child.status = OrderStatus.REJECTED
-            child.reject_reason = err
-            child.closed_at = datetime.now(timezone.utc)
-            audit.record(
-                db,
-                actor_user_id=item.subscriber_user_id,
-                action="copy.error",
-                entity_type="order",
-                entity_id=child.id,
-                metadata={"parent_order_id": str(trader_order.id), "error": err},
+            events.publish(sub_settings.user_id, {
+                "type": "copy.auto_paused",
+                "reason": "daily_loss_limit",
+                "daily_loss_limit": str(sub_settings.daily_loss_limit),
+                "todays_realized_pnl": str(todays_pnl),
+            })
+            db.commit()
+            return FanoutResult(
+                subscriber_user_id=sub_settings.user_id,
+                broker_account_id=target.broker_account_id,
+                order_id=None,
+                status="skipped_daily_loss_limit",
             )
-            results.append(FanoutResult(
-                subscriber_user_id=item.subscriber_user_id,
-                broker_account_id=item.broker_account_id,
-                order_id=child.id,
-                status="error",
-                detail=err[:200] if err else None,
-            ))
-            events.publish(item.subscriber_user_id, _order_event("order.copy_failed", child))
 
-    return results
+    # Sentinel from enumerate_fanout_targets when the subscriber has no
+    # broker — surface cleanly without trying to load a UUID(int=0) row.
+    if target.broker_account_id == uuid.UUID(int=0):
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_no_broker",
+        )
+
+    acct = db.get(BrokerAccount, target.broker_account_id)
+    if acct is None or acct.user_id != target.subscriber_user_id:
+        return FanoutResult(
+            subscriber_user_id=target.subscriber_user_id,
+            broker_account_id=target.broker_account_id,
+            order_id=None,
+            status="skipped_no_broker",
+        )
+
+    scaled = _scale_quantity(
+        trader_order.quantity, sub_settings.multiplier, acct.supports_fractional
+    )
+    if scaled <= 0:
+        audit.record(
+            db,
+            actor_user_id=sub_settings.user_id,
+            action="copy.skipped_zero_qty",
+            entity_type="order",
+            entity_id=trader_order.id,
+            metadata={
+                "trader_qty": str(trader_order.quantity),
+                "multiplier": str(sub_settings.multiplier),
+                "broker_account_id": str(acct.id),
+            },
+        )
+        db.commit()
+        return FanoutResult(
+            subscriber_user_id=sub_settings.user_id,
+            broker_account_id=acct.id,
+            order_id=None,
+            status="skipped_zero_qty",
+        )
+
+    # ── Create child Order row ────────────────────────────────────────────
+    child = Order(
+        user_id=sub_settings.user_id,
+        broker_account_id=acct.id,
+        parent_order_id=trader_order.id,
+        instrument_type=trader_order.instrument_type,
+        symbol=trader_order.symbol,
+        option_expiry=trader_order.option_expiry,
+        option_strike=trader_order.option_strike,
+        option_right=trader_order.option_right,
+        side=trader_order.side,
+        order_type=trader_order.order_type,
+        quantity=scaled,
+        limit_price=trader_order.limit_price,
+        stop_price=trader_order.stop_price,
+        status=OrderStatus.PENDING,
+    )
+    db.add(child)
+    db.flush()
+
+    # ── Place at broker (with retry/recovery) ─────────────────────────────
+    try:
+        sub_creds = decrypt_json(acct.encrypted_credentials)
+        sub_adapter = adapter_for(acct, sub_creds)
+    except Exception as exc:  # noqa: BLE001
+        child.status = OrderStatus.REJECTED
+        child.reject_reason = f"credentials_error: {exc}"[:480]
+        child.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db,
+            actor_user_id=sub_settings.user_id,
+            action="copy.error",
+            entity_type="order",
+            entity_id=child.id,
+            metadata={"parent_order_id": str(trader_order.id), "error": str(exc)[:300]},
+        )
+        db.commit()
+        events.publish(sub_settings.user_id, _order_event("order.copy_failed", child))
+        return FanoutResult(
+            subscriber_user_id=sub_settings.user_id,
+            broker_account_id=acct.id,
+            order_id=child.id,
+            status="error",
+            detail=str(exc)[:200],
+        )
+
+    request = BrokerOrderRequest(
+        instrument_type=child.instrument_type,
+        symbol=child.symbol,
+        side=child.side,
+        order_type=child.order_type,
+        quantity=child.quantity,
+        limit_price=child.limit_price,
+        stop_price=child.stop_price,
+        option_expiry=child.option_expiry,
+        option_strike=child.option_strike,
+        option_right=child.option_right,
+        client_order_id=str(child.id),
+    )
+
+    try:
+        resp = place_order_with_recovery(sub_adapter, request)
+    except RecoverableOrderError as rec:
+        child.status = OrderStatus.REJECTED
+        child.reject_reason = rec.friendly_message[:480]
+        child.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db,
+            actor_user_id=sub_settings.user_id,
+            action="copy.error",
+            entity_type="order",
+            entity_id=child.id,
+            metadata={
+                "parent_order_id": str(trader_order.id),
+                "friendly": rec.friendly_message,
+                "raw_error": str(rec.original)[:300],
+                "classification": "user_fixable",
+            },
+        )
+        db.commit()
+        events.publish(sub_settings.user_id, _order_event("order.copy_failed", child))
+        return FanoutResult(
+            subscriber_user_id=sub_settings.user_id,
+            broker_account_id=acct.id,
+            order_id=child.id,
+            status="error",
+            detail=rec.friendly_message[:200],
+        )
+    except Exception as exc:  # noqa: BLE001
+        child.status = OrderStatus.REJECTED
+        child.reject_reason = str(exc)[:480]
+        child.closed_at = datetime.now(timezone.utc)
+        audit.record(
+            db,
+            actor_user_id=sub_settings.user_id,
+            action="copy.error",
+            entity_type="order",
+            entity_id=child.id,
+            metadata={"parent_order_id": str(trader_order.id), "error": str(exc)[:480]},
+        )
+        db.commit()
+        events.publish(sub_settings.user_id, _order_event("order.copy_failed", child))
+        return FanoutResult(
+            subscriber_user_id=sub_settings.user_id,
+            broker_account_id=acct.id,
+            order_id=child.id,
+            status="error",
+            detail=str(exc)[:200],
+        )
+
+    # Happy path: broker accepted.
+    child.status = resp.status
+    child.broker_order_id = resp.broker_order_id
+    child.submitted_at = resp.submitted_at
+    child.filled_quantity = resp.filled_quantity
+    child.filled_avg_price = resp.filled_avg_price
+    audit.record(
+        db,
+        actor_user_id=sub_settings.user_id,
+        action="copy.submitted",
+        entity_type="order",
+        entity_id=child.id,
+        metadata={
+            "parent_order_id": str(trader_order.id),
+            "broker_order_id": resp.broker_order_id,
+            "scaled_qty": str(child.quantity),
+        },
+    )
+    db.commit()
+    events.publish(sub_settings.user_id, _order_event("order.copy_submitted", child))
+    return FanoutResult(
+        subscriber_user_id=sub_settings.user_id,
+        broker_account_id=acct.id,
+        order_id=child.id,
+        status="submitted",
+    )
+
+
+# ─── In-process orchestrator (the existing public surface) ──────────────────
+
+def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]:
+    """Mirror ``trader_order`` to every subscriber following ``trader``.
+
+    Default in-process implementation: builds the target list, then runs
+    ``process_one_fanout`` for each target in a ThreadPoolExecutor. Each
+    worker thread opens its own DB session so this is connection-pool-bound
+    rather than session-thread-bound.
+
+    Equivalent behaviour to what we had before this refactor — same gates,
+    same audit log entries, same SSE events, same overall latency profile.
+    """
+    targets = enumerate_fanout_targets(db, trader.id)
+    if not targets:
+        return []
+
+    # Commit so each worker session sees the trader_order + any state mutated
+    # during enumeration (none today, but future-proof).
+    db.commit()
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(targets))) as pool:
+        return list(pool.map(
+            lambda t: process_one_fanout(trader_order.id, t),
+            targets,
+        ))
 
 
 def _order_event(event_type: str, order: Order) -> dict[str, Any]:

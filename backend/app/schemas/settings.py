@@ -18,6 +18,8 @@ class SubscriberSettingsOut(BaseModel):
 class TraderSettingsOut(BaseModel):
     user_id: uuid.UUID
     trading_enabled: bool
+    copy_paused: bool = False
+    mirror_external_trades: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -45,6 +47,14 @@ class FollowTraderIn(BaseModel):
 
 class TraderToggleIn(BaseModel):
     trading_enabled: bool
+
+
+class TraderMirrorExternalIn(BaseModel):
+    """Trader opts in to having orders they place DIRECTLY at their broker
+    (outside our Trade Panel) mirrored to subscribers. Default-off elsewhere
+    so existing traders don't get surprised."""
+
+    mirror_external_trades: bool
 
 
 class SubscriberMultiplierIn(BaseModel):

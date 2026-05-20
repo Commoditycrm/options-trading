@@ -12,6 +12,7 @@ from app.schemas.settings import (
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
     SubscriberToggleIn,
+    TraderMirrorExternalIn,
     TraderSettingsOut,
     TraderToggleIn,
 )
@@ -182,6 +183,37 @@ def toggle_trading(
         entity_type="trader_settings",
         entity_id=user.id,
         metadata={"trading_enabled": payload.trading_enabled},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    return s
+
+
+@router.patch("/trader/mirror-external", response_model=TraderSettingsOut)
+def toggle_mirror_external(
+    payload: TraderMirrorExternalIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> TraderSettings:
+    """Opt the trader in/out of having their direct-at-broker trades
+    mirrored to subscribers. When True, the trade-update stream watches the
+    trader's broker accounts and triggers fanout for any order placed
+    outside our Trade Panel. Default-off so this is always an explicit
+    decision by the trader."""
+    s = db.get(TraderSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.mirror_external_trades
+    s.mirror_external_trades = payload.mirror_external_trades
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="trader.mirror_external_toggled",
+        entity_type="trader_settings",
+        entity_id=user.id,
+        metadata={"old": old, "new": payload.mirror_external_trades},
         ip_address=client_ip(request),
     )
     db.commit()

@@ -22,6 +22,14 @@ class TraderSettings(Base, TimestampMixin):
     # regardless of their preference.
     copy_paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # When True, orders the trader places DIRECTLY at their broker (e.g. via
+    # Alpaca's own web UI, IBKR TWS, or any other path that bypasses our
+    # Trade Panel) are detected via the broker trade-update stream and
+    # fanned out to subscribers automatically.
+    # Default OFF so day-1 traders aren't surprised by their hedge / test
+    # trades being mirrored. Trader explicitly opts in via Settings page.
+    mirror_external_trades: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     user = relationship("User", back_populates="trader_settings")
 
 
