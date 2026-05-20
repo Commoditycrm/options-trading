@@ -63,6 +63,46 @@ services:
         value: https://copy-trading-app.vercel.app
       - key: PYTHON_VERSION
         value: "3.11.9"
+      # Redis Streams for parallel copy-trade fan-out. See doc/DEPLOY.md
+      # for Upstash free-tier setup. Leave blank to fall back to the
+      # in-process ThreadPoolExecutor dispatch (fine for single-trader,
+      # <50 subscribers; won't scale beyond one pod).
+      - key: REDIS_URL
+        sync: false                # set manually via dashboard
+      # When True, the FastAPI process also runs a fanout worker as an
+      # asyncio task. Cheaper (no second Render service) but caps the
+      # worker pool at one instance. Flip to False once you spin up the
+      # dedicated worker service below.
+      - key: RUN_FANOUT_WORKER_IN_PROCESS
+        value: "true"
+
+  # ── Optional: dedicated fanout worker ────────────────────────────────
+  # Uncomment this block to scale fanout independently of the backend.
+  # Worker services on Render start at $7/mo (no free tier for workers,
+  # unlike web services). Keeps the backend free for HTTP/SSE traffic
+  # and lets you bump worker count under load.
+  #
+  # Before enabling: set RUN_FANOUT_WORKER_IN_PROCESS=false on the
+  # backend (above) so you don't run two consumer instances by accident.
+  #
+  # - type: worker
+  #   name: signalboxx-fanout-worker
+  #   runtime: python
+  #   plan: starter
+  #   rootDir: backend
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: python worker.py
+  #   envVars:
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: signalboxx-db
+  #         property: connectionString
+  #     - key: CREDENTIAL_ENCRYPTION_KEY
+  #       sync: false
+  #     - key: REDIS_URL
+  #       sync: false
+  #     - key: PYTHON_VERSION
+  #       value: "3.11.9"
 
 databases:
   - name: signalboxx-db

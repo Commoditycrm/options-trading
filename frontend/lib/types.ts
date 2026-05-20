@@ -110,6 +110,11 @@ export interface SubscriberSettings {
 export interface TraderSettings {
   user_id: string;
   trading_enabled: boolean;
+  copy_paused?: boolean;
+  // When True, orders the trader places DIRECTLY at their broker (outside
+  // this app) are detected via the broker trade-update stream and fanned
+  // out to subscribers. Default OFF.
+  mirror_external_trades?: boolean;
 }
 
 export interface SubscriberSummary {

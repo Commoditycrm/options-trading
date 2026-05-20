@@ -46,8 +46,18 @@ from sqlalchemy import select
 from app.brokers.alpaca import _STATUS_IN
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import Fill, Order, OrderStatus
-from app.services import audit, events
+from app.models.order import (
+    Fill,
+    InstrumentType,
+    Order,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
+from app.models.settings import TraderSettings
+from app.models.user import User, UserRole
+from app.services import audit, events, fanout_stream
+from app.services.copy_engine import enumerate_fanout_targets
 from app.services.crypto import decrypt_json
 
 log = logging.getLogger(__name__)
@@ -146,6 +156,183 @@ def _build_event(order: Order) -> dict[str, Any]:
     }
 
 
+def _alpaca_side_to_ours(side: Any) -> OrderSide:
+    """Map Alpaca's order.side string ("buy" / "sell") to our enum."""
+    s = str(side or "").lower()
+    return OrderSide.SELL if s == "sell" else OrderSide.BUY
+
+
+def _alpaca_type_to_ours(order_type: Any) -> OrderType:
+    """Map Alpaca's order_type field to our enum. Falls back to MARKET so
+    we never crash on a new Alpaca order type we don't recognize."""
+    t = str(order_type or "").lower()
+    if t in ("limit",):
+        return OrderType.LIMIT
+    if t in ("stop",):
+        return OrderType.STOP
+    if t in ("stop_limit", "stop limit"):
+        return OrderType.STOP_LIMIT
+    return OrderType.MARKET
+
+
+def _maybe_handle_external_order(
+    db,
+    account_id: uuid.UUID,
+    raw_order: Any,
+    broker_oid: str,
+    event_name: str,
+) -> Order | None:
+    """If the trade-update is for an order placed OUTSIDE our platform
+    (trader used Alpaca's own UI, mobile app, etc.) AND the account
+    owner is a trader who's opted in to mirror_external_trades, create
+    a local Order row representing the trade and dispatch fanout.
+
+    Returns the created Order (so the caller can continue applying
+    status / fill updates to it as more events arrive), or None when
+    we shouldn't act on the message.
+
+    Gating logic (any miss returns None):
+      - Account must exist and belong to a trader
+      - Trader must have TraderSettings.mirror_external_trades = True
+      - Event must be one of: "new", "accepted" (we mirror at order
+        acceptance — fastest fanout. Later fill events follow the
+        normal in-place update path via broker_order_id lookup)
+      - We only create on first sighting; subsequent events for the
+        same broker_oid find the Order via _resolve_local_order
+    """
+    if event_name not in ("new", "accepted"):
+        return None
+
+    acct = db.get(BrokerAccount, account_id)
+    if acct is None:
+        return None
+    owner = db.get(User, acct.user_id)
+    if owner is None or owner.role != UserRole.TRADER:
+        return None
+
+    ts = db.get(TraderSettings, owner.id)
+    if ts is None or not ts.mirror_external_trades:
+        # Trader hasn't opted in — log once for visibility so the audit
+        # trail shows the platform saw an external trade and chose not
+        # to act. Useful when client asks "why didn't my trade fan out?"
+        audit.record(
+            db, actor_user_id=owner.id, action="trader.external_trade_ignored",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata={
+                "broker_order_id": broker_oid,
+                "reason": "mirror_external_trades=false",
+                "symbol": str(getattr(raw_order, "symbol", "") or ""),
+            },
+        )
+        db.commit()
+        return None
+
+    if not ts.trading_enabled:
+        # Master kill switch is off — surface that as a clear audit so
+        # the trader can find it later.
+        audit.record(
+            db, actor_user_id=owner.id, action="trader.external_trade_ignored",
+            entity_type="broker_account", entity_id=acct.id,
+            metadata={
+                "broker_order_id": broker_oid,
+                "reason": "trading_enabled=false",
+                "symbol": str(getattr(raw_order, "symbol", "") or ""),
+            },
+        )
+        db.commit()
+        return None
+
+    # Extract trade details from the broker's order representation.
+    symbol = str(getattr(raw_order, "symbol", "") or "").upper()
+    if not symbol:
+        return None
+    qty = _dec(getattr(raw_order, "qty", None))
+    if qty <= 0:
+        return None
+
+    # OCC option symbol detection (same heuristic as fills_sync.py).
+    instrument = InstrumentType.STOCK
+    option_expiry = option_strike = option_right = None
+    display_symbol = symbol
+    if len(symbol) >= 18 and symbol[-9] in ("C", "P"):
+        instrument = InstrumentType.OPTION
+        from app.models.order import OptionRight
+        try:
+            display_symbol = symbol[:-15].strip()
+            yymmdd = symbol[-15:-9]
+            cp = symbol[-9]
+            strike_str = symbol[-8:]
+            from datetime import date as _date
+            option_expiry = _date(2000 + int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+            option_strike = Decimal(int(strike_str)) / Decimal(1000)
+            option_right = OptionRight.CALL if cp == "C" else OptionRight.PUT
+        except (ValueError, IndexError):
+            # Couldn't parse OCC — fall back to treating it as a stock so
+            # we don't drop the trade entirely.
+            instrument = InstrumentType.STOCK
+            display_symbol = symbol
+
+    order = Order(
+        user_id=owner.id,
+        broker_account_id=acct.id,
+        instrument_type=instrument,
+        symbol=display_symbol,
+        option_expiry=option_expiry,
+        option_strike=option_strike,
+        option_right=option_right,
+        side=_alpaca_side_to_ours(getattr(raw_order, "side", None)),
+        order_type=_alpaca_type_to_ours(getattr(raw_order, "order_type", None)),
+        quantity=qty,
+        limit_price=_dec_or_none(getattr(raw_order, "limit_price", None)),
+        stop_price=_dec_or_none(getattr(raw_order, "stop_price", None)),
+        status=OrderStatus.SUBMITTED,
+        broker_order_id=broker_oid,
+        submitted_at=datetime.now(timezone.utc),
+        fanned_out_to_subscribers=True,    # opt-in flag forced us here
+    )
+    db.add(order)
+    db.flush()
+
+    audit.record(
+        db, actor_user_id=owner.id, action="trader.external_order_detected",
+        entity_type="order", entity_id=order.id,
+        metadata={
+            "broker_order_id": broker_oid,
+            "symbol": display_symbol,
+            "side": order.side.value,
+            "qty": str(qty),
+            "instrument": instrument.value,
+            "event": event_name,
+        },
+    )
+
+    # Dispatch fanout. Prefer Redis Streams when configured (parallel
+    # processing across worker pods); fall back to in-process if not.
+    targets = enumerate_fanout_targets(db, owner.id)
+    if fanout_stream.is_configured():
+        count = fanout_stream.publish_targets(order.id, targets)
+        audit.record(
+            db, actor_user_id=owner.id, action="trader.fanout_dispatched",
+            entity_type="order", entity_id=order.id,
+            metadata={
+                "dispatch": "redis_stream",
+                "source": "external",
+                "target_count": count,
+            },
+        )
+    else:
+        # Defer in-process fanout to AFTER we commit so the trader Order
+        # is visible to worker sessions. We don't have a great mechanism
+        # for that here (this is a sync function inside the stream
+        # handler), so we just commit + call fanout synchronously.
+        db.commit()
+        from app.services.copy_engine import fanout as _fanout_in_process
+        _fanout_in_process(db, order, owner)
+    db.commit()
+
+    return order
+
+
 def _apply_trade_update(account_id: uuid.UUID, data: Any) -> None:
     """Sync DB write. Called from inside an async handler — runs fast enough
     (single-row lookups + at most 1 insert) that blocking the loop is fine
@@ -165,15 +352,18 @@ def _apply_trade_update(account_id: uuid.UUID, data: Any) -> None:
     with SessionLocal() as db:
         order = _resolve_local_order(db, account_id, broker_oid, client_oid)
         if order is None:
-            # Externally-placed trade (in Alpaca's UI directly) — let the
-            # next sync-fills pass turn it into a synthetic Order. We skip
-            # creating one here because the WebSocket can fire before the
-            # account_activities feed indexes it, and we'd race ourselves.
-            log.debug(
-                "alpaca_stream: trade_update for unknown order acct=%s broker_oid=%s event=%s",
-                account_id, broker_oid, event_name,
-            )
-            return
+            # Externally-placed trade (the trader placed it via Alpaca's
+            # own UI, the Alpaca mobile app, an algo running outside our
+            # platform, etc.). If the account owner is a trader who's
+            # opted in to mirror_external_trades, materialize a local
+            # Order and fan out. Otherwise log + return.
+            order = _maybe_handle_external_order(db, account_id, raw_order, broker_oid, event_name)
+            if order is None:
+                log.debug(
+                    "alpaca_stream: ignoring unknown order acct=%s broker_oid=%s event=%s",
+                    account_id, broker_oid, event_name,
+                )
+                return
 
         # Update status / filled qty / VWAP from the broker's view of the order.
         new_status = _STATUS_IN.get(getattr(raw_order, "status", None), order.status)

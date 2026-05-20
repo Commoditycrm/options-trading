@@ -25,6 +25,21 @@ class Settings(BaseSettings):
     ibkr_private_encryption_pem: str = ""
     ibkr_private_signature_pem: str = ""
 
+    # Redis for fanout work-queue (Streams + Consumer Groups, NOT pub/sub —
+    # we need one message per worker, not broadcast). Set REDIS_URL to a
+    # full redis:// or rediss:// URL. Leave blank to disable Redis-based
+    # fanout entirely; in that case copy_engine.fanout runs the existing
+    # in-process ThreadPoolExecutor path (fine for single-pod dev).
+    redis_url: str = ""
+    fanout_stream: str = "signalboxx:fanout"     # XADD stream name
+    fanout_group: str = "fanout_workers"          # consumer group
+
+    # When True, the FastAPI process also starts a fanout worker as an
+    # asyncio task at boot. Convenient for local dev (no second process to
+    # run). Production should set this to False and run worker.py as a
+    # separate Render service so the worker can scale independently.
+    run_fanout_worker_in_process: bool = True
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

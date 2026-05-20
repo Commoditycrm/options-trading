@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import auth, brokers, events, options, positions, settings, subscribers, trades
 from app.config import get_settings
-from app.services import alpaca_stream
+from app.services import alpaca_stream, fanout_stream
 from app.services import events as events_bus
 
 DISCLAIMER = (
@@ -54,6 +54,23 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def _stop_alpaca_streams() -> None:
         await alpaca_stream.stop_all_streams()
+
+    @app.on_event("startup")
+    async def _start_fanout_worker() -> None:
+        # Local-dev convenience: run a fanout worker as an asyncio task inside
+        # the FastAPI process. Production should set
+        # RUN_FANOUT_WORKER_IN_PROCESS=false on Render and run worker.py as a
+        # separate service so workers scale independently.
+        if not s.redis_url:
+            return
+        if not s.run_fanout_worker_in_process:
+            return
+        loop = asyncio.get_running_loop()
+        # consume_loop is blocking sync code → run it in a thread executor
+        # so it doesn't starve the FastAPI event loop. One thread per
+        # in-process worker; bump count if you need more parallelism on
+        # local dev (production uses separate processes instead).
+        loop.run_in_executor(None, fanout_stream.consume_loop)
 
     @app.get("/api/health")
     def health() -> dict:

@@ -14,7 +14,7 @@ from app.models.order import Order, OrderSide, OrderStatus
 from app.models.settings import SubscriberSettings
 from app.models.user import User, UserRole
 from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
-from app.services import audit, copy_engine, events, fills_sync
+from app.services import audit, copy_engine, events, fanout_stream, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
 from app.services.pnl import realized_pnl_by_day
@@ -262,21 +262,54 @@ def _submit_to_broker_in_background(
         events.publish(actor.id, copy_engine._order_event("order.updated", order))
 
         if will_fanout:
-            fan_results = copy_engine.fanout(db, order, actor)
-            audit.record(
-                db,
-                actor_user_id=actor.id,
-                action="trader.fanout_complete",
-                entity_type="order",
-                entity_id=order.id,
-                metadata={
-                    "subscriber_count": len({r.subscriber_user_id for r in fan_results}),
-                    "submitted": sum(1 for r in fan_results if r.status == "submitted"),
-                    "errors": sum(1 for r in fan_results if r.status == "error"),
-                    "skipped": sum(1 for r in fan_results if r.status.startswith("skipped")),
-                },
-            )
-            db.commit()
+            # Two dispatch paths:
+            #
+            #   1. Redis Streams (production / scale): enumerate targets +
+            #      XADD one message per (subscriber, broker_account). The
+            #      worker pool consumes and places mirror orders in parallel.
+            #      Returns immediately — broker calls happen in workers, the
+            #      subscriber's UI updates via order.copy_submitted SSE
+            #      published from inside process_one_fanout.
+            #
+            #   2. In-process (no Redis configured, e.g. early dev):
+            #      copy_engine.fanout runs the ThreadPoolExecutor path
+            #      inline. Same observable outcome.
+            #
+            # Either way, audit "trader.fanout_dispatched" tracks the
+            # decision; the per-target submitted/error/skipped audit lives
+            # in process_one_fanout itself (so we don't double-count).
+            if fanout_stream.is_configured():
+                targets = copy_engine.enumerate_fanout_targets(db, actor.id)
+                count = fanout_stream.publish_targets(order.id, targets)
+                audit.record(
+                    db,
+                    actor_user_id=actor.id,
+                    action="trader.fanout_dispatched",
+                    entity_type="order",
+                    entity_id=order.id,
+                    metadata={
+                        "dispatch": "redis_stream",
+                        "target_count": count,
+                    },
+                )
+                db.commit()
+            else:
+                fan_results = copy_engine.fanout(db, order, actor)
+                audit.record(
+                    db,
+                    actor_user_id=actor.id,
+                    action="trader.fanout_complete",
+                    entity_type="order",
+                    entity_id=order.id,
+                    metadata={
+                        "dispatch": "in_process",
+                        "subscriber_count": len({r.subscriber_user_id for r in fan_results}),
+                        "submitted": sum(1 for r in fan_results if r.status == "submitted"),
+                        "errors": sum(1 for r in fan_results if r.status == "error"),
+                        "skipped": sum(1 for r in fan_results if r.status.startswith("skipped")),
+                    },
+                )
+                db.commit()
 
 
 def _place_trader_order(

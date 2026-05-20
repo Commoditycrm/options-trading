@@ -99,6 +99,20 @@ export default function SettingsPage() {
       method: "PATCH", body: JSON.stringify({ trading_enabled: next })
     }));
   }
+  async function toggleMirrorExternal(next: boolean) {
+    try {
+      setTrd(await api<TraderSettings>("/api/settings/trader/mirror-external", {
+        method: "PATCH", body: JSON.stringify({ mirror_external_trades: next })
+      }));
+      notify.success(
+        next
+          ? "Mirroring is ON — trades you place directly at your broker will fan out to subscribers."
+          : "Mirroring is OFF — only orders placed through this app will fan out."
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not change external-trade mirroring");
+    }
+  }
 
   if (!user) return <p style={{color: "var(--muted)"}}>Loading…</p>;
 
@@ -252,6 +266,7 @@ export default function SettingsPage() {
       )}
 
       {user.role === "trader" && trd && (
+        <>
         <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
           <div className="flex items-center justify-between">
             <div>
@@ -269,6 +284,33 @@ export default function SettingsPage() {
             </button>
           </div>
         </section>
+
+        <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <h2 className="font-medium">Mirror trades placed directly at my broker</h2>
+              <p className="text-sm mt-1" style={{color: "var(--muted)"}}>
+                When ON, orders you place outside this app — e.g. via your
+                broker's own web UI or mobile app — are detected via the live
+                trade-update stream and fanned out to subscribers automatically.
+                You don't need to use the Trade Panel; trade like you normally
+                would and we mirror it. Default is OFF so test or hedge trades
+                don't get copied without your intent.
+              </p>
+            </div>
+            <button
+              onClick={() => toggleMirrorExternal(!trd.mirror_external_trades)}
+              className="px-4 py-2 rounded font-medium shrink-0"
+              style={{
+                background: trd.mirror_external_trades ? "var(--good)" : "var(--border)",
+                color: trd.mirror_external_trades ? "#06121f" : "var(--text)",
+              }}
+            >
+              {trd.mirror_external_trades ? "ON" : "OFF"}
+            </button>
+          </div>
+        </section>
+        </>
       )}
     </div>
   );
