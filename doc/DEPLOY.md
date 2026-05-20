@@ -72,6 +72,36 @@ When the team is ready for AWS:
 | `IBKR_DH_PARAM_PEM` | backend (optional) | Multiline PEM contents (not a file path). Generate per IBKR's onboarding docs; upload the public half to your IBKR developer console. |
 | `IBKR_PRIVATE_ENCRYPTION_PEM` | backend (optional) | Multiline PEM contents. Same pattern as DH param. |
 | `IBKR_PRIVATE_SIGNATURE_PEM` | backend (optional) | Multiline PEM contents. Same pattern. |
+| `REDIS_URL` | backend + worker (optional) | Full `redis://` or `rediss://` URL. Drives the Redis-Streams copy-trade fanout. Leave blank to fall back to in-process ThreadPoolExecutor dispatch (single-pod only). See "Redis Streams setup" below. |
+| `RUN_FANOUT_WORKER_IN_PROCESS` | backend (optional) | `true` (default) runs a fanout worker as an asyncio task inside the FastAPI process — convenient for local + single-Render-service deploys. Set `false` only when you've enabled the dedicated worker service in render.yaml so you don't run two consumer instances at once. |
+
+### Redis Streams setup
+
+The copy-trade fanout uses Redis Streams + Consumer Groups so multiple worker processes can share the work in parallel without duplicating mirror orders (which standard Redis Pub/Sub would do — it broadcasts every message to every subscriber). With Streams, each `(trader_order, subscriber, broker_account)` message goes to exactly one worker.
+
+**Local dev:** the `docker-compose.yml` brings Redis up alongside Postgres. Set `REDIS_URL=redis://localhost:6379/0` in your `.env`. The FastAPI process also runs a fanout worker in-process by default (`RUN_FANOUT_WORKER_IN_PROCESS=true`) so you don't manage a separate worker process locally.
+
+**Render / production:** the simplest path is **Upstash free tier** — sign up at https://upstash.com, create a Redis database (the free tier gives you 256MB storage, 10K commands/day, always-on, no spin-down), copy the connection URL, paste into Render → Environment → `REDIS_URL`. Render's own Key-Value service works too at ~$10/mo if you want everything in one dashboard.
+
+**Scaling to a dedicated worker service** (when single-pod isn't enough):
+
+1. In `render.yaml`, uncomment the `signalboxx-fanout-worker` block.
+2. Set `RUN_FANOUT_WORKER_IN_PROCESS=false` on the backend so you don't have two consumers competing.
+3. Deploy. The worker service runs `python worker.py` and consumes from the same stream/group as the in-process worker did. Scale the worker count up/down independently of the backend.
+
+**Inspecting the stream** (debugging fanout):
+
+```bash
+# Show pending messages waiting on the consumer group
+redis-cli XPENDING signalboxx:fanout fanout_workers
+
+# Show stream metadata + active consumers
+redis-cli XINFO STREAM signalboxx:fanout
+redis-cli XINFO CONSUMERS signalboxx:fanout fanout_workers
+
+# Read the last 10 messages (regardless of consumer group)
+redis-cli XREVRANGE signalboxx:fanout + - COUNT 10
+```
 
 ### IBKR onboarding (one-time, app-level)
 

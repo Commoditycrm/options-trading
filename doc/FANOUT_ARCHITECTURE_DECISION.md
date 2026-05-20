@@ -1,8 +1,12 @@
-# Fan-out architecture: in-process today vs. Redis pub/sub later
+# Fan-out architecture: in-process vs. Redis Streams
 
-This doc compares the architecture currently implemented in the SignalBoxx backend against the Redis-based architecture sketched in the recent design discussion. The goal is to give the client enough context to make an informed call on whether (and when) to migrate.
+> **DECISION (2026-05-20):** **Redis Streams + Consumer Groups** is implemented and lives behind the `REDIS_URL` env var. When `REDIS_URL` is unset the codebase silently falls back to the in-process ThreadPoolExecutor path documented below (still functional for local dev and very-small deploys). The decision came after the client shared a flow diagram showing the Redis-based dispatch model and we confirmed the technical concern: standard Pub/Sub would have broadcast every fanout message to every worker, causing N × duplicate mirror orders. **Streams + Consumer Groups is the correct Redis primitive for this** — each message goes to exactly one worker in the group.
+>
+> The rest of this doc explains the trade-off framework that informed the decision. Kept for historical context and for re-evaluating if the deployment shape ever changes.
 
-> TL;DR — Both architectures deliver the same user-visible behaviour today: trader places an order, every subscriber's broker receives it in parallel within milliseconds, every subscriber's UI updates without a refresh. The difference is what becomes possible **later** as the platform grows.
+---
+
+This doc compares the in-process implementation (still default fallback) against the Redis-Streams architecture (now active when `REDIS_URL` is set). Both ship the same user-visible behaviour: trader places an order, every subscriber's broker receives it in parallel within milliseconds, every subscriber's UI updates without a refresh. The difference is what becomes possible **as the platform grows**.
 
 ---
 
@@ -43,20 +47,36 @@ Trader API ─► FastAPI BackgroundTask
 
 One Python process holds everything. The "parallelism" is OS threads inside that process. SSE notifications are an in-memory dict-of-queues.
 
-### Proposed Redis-pub/sub implementation
+### Redis Streams implementation (what we shipped)
 
 ```
-Trader API ─► Publish to Redis (channel: trade.fanout)
-                  │
-                  └─► [Worker A]   [Worker B]   [Worker C]
-                       │            │            │
-                       └─► One subscriber's broker call per worker pickup
-                  │
-                  └─► Redis pub/sub for SSE (channel: user.{id}.events)
-                       └─► Each backend pod's SSE endpoint reads its users' channels
+Trader places direct at broker         Or trader uses our Trade Panel
+   │                                       │
+   ▼                                       ▼
+[alpaca_stream.py detects "new"]      [api/trades.py async background task]
+   │                                       │
+   └────────── (both paths converge) ──────┘
+                                       │
+                          enumerate_fanout_targets(db, trader_id)
+                                       │
+                          XADD one message per (subscriber, broker_account)
+                                       │
+                                       ▼
+                       [Redis Stream: signalboxx:fanout]
+                                       │
+                          XREADGROUP (consumer group: fanout_workers)
+                                       │
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                        ▼
+        [Worker A]                [Worker B]                [Worker C]
+   process_one_fanout()      process_one_fanout()      process_one_fanout()
+   - gate checks                                       (each worker pulls
+   - place mirror order                                 one message, ACKs
+   - audit + SSE                                        after success)
+   - XACK
 ```
 
-The trader API process and the worker processes are separate. They communicate through Redis. SSE notifications also flow through Redis so any backend pod can serve any user's live stream.
+The detection / trader-API process and the worker processes are separate (in production). They communicate through Redis Streams. SSE notifications still flow through the in-memory `services/events.py` event bus since they're per-user broadcasts that don't benefit from Streams' work-queue semantics — that's the only piece still single-process. If you go multi-pod backend later, that's the next thing to swap (Redis Pub/Sub IS the right tool for SSE, just not for fanout).
 
 ---
 
