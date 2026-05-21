@@ -8,7 +8,7 @@ export interface User {
   is_active: boolean;
 }
 
-export type BrokerName = "alpaca";
+export type BrokerName = "alpaca" | "ibkr";
 
 export interface BrokerAccount {
   id: string;
