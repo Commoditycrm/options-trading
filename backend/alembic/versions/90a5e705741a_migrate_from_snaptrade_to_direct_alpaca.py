@@ -30,8 +30,11 @@ def upgrade() -> None:
     # Drop any orphaned enum type from earlier failed runs.
     op.execute("DROP TYPE IF EXISTS broker_name")
 
-    # 3. Re-create broker_accounts with the new shape. create_table auto-creates
-    #    the broker_name enum from the Column definition.
+    # 3. Re-create the broker_name enum explicitly. The inline sa.Enum(...) on
+    #    the column below uses create_type=False so we don't double-create.
+    broker_name_enum = sa.Enum("alpaca", name="broker_name")
+    broker_name_enum.create(op.get_bind(), checkfirst=True)
+
     op.create_table(
         "broker_accounts",
         sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
@@ -41,7 +44,7 @@ def upgrade() -> None:
             sa.ForeignKey("users.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("broker", sa.Enum("alpaca", name="broker_name"), nullable=False),
+        sa.Column("broker", sa.Enum("alpaca", name="broker_name", create_type=False), nullable=False),
         sa.Column("label", sa.String(120), nullable=False),
         sa.Column("is_paper", sa.Boolean(), nullable=False, server_default=sa.true()),
         sa.Column("supports_fractional", sa.Boolean(), nullable=False, server_default=sa.true()),
