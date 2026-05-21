@@ -56,21 +56,30 @@ def create_app() -> FastAPI:
         await alpaca_stream.stop_all_streams()
 
     @app.on_event("startup")
-    async def _start_fanout_worker() -> None:
-        # Local-dev convenience: run a fanout worker as an asyncio task inside
-        # the FastAPI process. Production should set
-        # RUN_FANOUT_WORKER_IN_PROCESS=false on Render and run worker.py as a
-        # separate service so workers scale independently.
+    async def _start_fanout_workers() -> None:
+        # Run N fanout workers as asyncio thread-pool tasks inside the
+        # FastAPI process. Each worker pulls from the SAME Consumer Group,
+        # so the queue is drained in parallel — true concurrent broker calls
+        # rather than serial. Worker count is FANOUT_WORKER_COUNT (env var,
+        # default 8).
+        #
+        # For 100+ subscribers and tight latency targets, swap to a
+        # dedicated worker service: set RUN_FANOUT_WORKER_IN_PROCESS=false
+        # here and uncomment the worker block in render.yaml. That lets you
+        # bump worker count without sharing memory with the HTTP server.
         if not s.redis_url:
             return
         if not s.run_fanout_worker_in_process:
             return
         loop = asyncio.get_running_loop()
-        # consume_loop is blocking sync code → run it in a thread executor
-        # so it doesn't starve the FastAPI event loop. One thread per
-        # in-process worker; bump count if you need more parallelism on
-        # local dev (production uses separate processes instead).
-        loop.run_in_executor(None, fanout_stream.consume_loop)
+        for _ in range(s.fanout_worker_count):
+            # consume_loop is blocking sync code → run each in a thread
+            # executor so they don't starve the FastAPI event loop.
+            loop.run_in_executor(None, fanout_stream.consume_loop)
+        import logging
+        logging.getLogger("uvicorn").info(
+            "started %d in-process fanout worker(s)", s.fanout_worker_count,
+        )
 
     @app.get("/api/health")
     def health() -> dict:

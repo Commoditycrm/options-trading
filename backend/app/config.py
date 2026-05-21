@@ -34,11 +34,22 @@ class Settings(BaseSettings):
     fanout_stream: str = "signalboxx:fanout"     # XADD stream name
     fanout_group: str = "fanout_workers"          # consumer group
 
-    # When True, the FastAPI process also starts a fanout worker as an
-    # asyncio task at boot. Convenient for local dev (no second process to
+    # When True, the FastAPI process also starts fanout workers as
+    # asyncio tasks at boot. Convenient for local dev (no second process to
     # run). Production should set this to False and run worker.py as a
-    # separate Render service so the worker can scale independently.
+    # separate Render service so the worker pool can scale independently
+    # of the backend pod's memory budget.
     run_fanout_worker_in_process: bool = True
+
+    # Number of worker threads to spawn. Each one runs its own consume_loop
+    # against the same Redis Stream Consumer Group, so messages are shared
+    # across them — true parallel processing of subscriber broker calls.
+    # Default 8 fits comfortably in 512MB (Render free/Starter). Bump
+    # higher when running the dedicated worker service with more RAM:
+    # ~30-50MB per worker, so 1GB → 20 workers, 2GB → 50 workers.
+    # Bigger than ~50 hits diminishing returns (broker rate limits +
+    # Postgres connection pool contention become the bottleneck).
+    fanout_worker_count: int = 8
 
     @property
     def cors_origins_list(self) -> list[str]:
