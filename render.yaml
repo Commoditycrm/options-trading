@@ -36,10 +36,14 @@ services:
                           # trade-update WebSocket. Fine for dev; not for prod.
     rootDir: backend
     buildCommand: pip install -r requirements.txt
-    # alembic upgrade head runs on every deploy via preDeployCommand. The
-    # web service starts only after migrations succeed.
-    preDeployCommand: alembic upgrade head
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    # Migrations run inline at startup. Ideally this would be a
+    # preDeployCommand (cleaner: web service only starts AFTER migrations
+    # succeed), but Render's free tier doesn't support preDeployCommand.
+    # Workaround: alembic + uvicorn chained in startCommand — if alembic
+    # fails, uvicorn never starts and the service shows as failed (same
+    # net effect). When you upgrade to Starter, move alembic back into
+    # preDeployCommand for cleaner separation.
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
