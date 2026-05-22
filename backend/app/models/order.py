@@ -31,6 +31,11 @@ class OrderStatus(str, enum.Enum):
     CANCELED = "canceled"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    # First attempt failed with a transient/broker-disconnect error; the
+    # retry_scheduler will pick this up at retry_at and try again. If the
+    # retry also fails the order moves to REJECTED (and a notification is
+    # sent to the subscriber).
+    RETRY_PENDING = "retry_pending"
 
 
 class InstrumentType(str, enum.Enum):
@@ -100,6 +105,25 @@ class Order(Base, TimestampMixin):
     # copy was paused, and orders placed with skip_fanout (e.g. Exit All "Just
     # me" scope). Powers the "My Orders" tab in Order History.
     fanned_out_to_subscribers: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # True for orders that are CLOSING a position (the SELL side of a buy,
+    # or any leg of an Exit All). Set by close_trade / positions/close-all
+    # endpoints, and propagated to subscriber mirror orders during fanout.
+    # Read by the retry scheduler to pick between retry_interval_open and
+    # retry_interval_close on the subscriber's settings.
+    is_closing: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False
+    )
+
+    # Retry scheduling. NULL retry_at = no retry pending. retry_attempted
+    # flips to True after a single retry attempt has been made — the
+    # scheduler never tries again after that (v1 = single-retry only).
+    retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    retry_attempted: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False
     )
 
