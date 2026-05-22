@@ -44,6 +44,13 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=s.cors_origins_list,
+        # allow_origin_regex covers Vercel's per-deployment URLs (production
+        # alias + previews). EventSource hits us directly cross-origin (it
+        # bypasses the Next.js rewrite to avoid Vercel's edge timeout on
+        # long-lived SSE), so the Origin header is the user's Vercel URL —
+        # which changes per deploy. Regex avoids re-setting CORS_ORIGINS
+        # every time Vercel creates a new preview URL.
+        allow_origin_regex=s.cors_origin_regex or None,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

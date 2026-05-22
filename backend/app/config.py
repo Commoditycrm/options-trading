@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     jwt_refresh_token_days: int = 14
     credential_encryption_key: str
     cors_origins: str = "http://localhost:3000"
+    # Regex pattern matched against the Origin header. Anything matching this
+    # is treated as an allowed origin, in addition to cors_origins above.
+    # Default covers Vercel's "production alias" + "<commit>-<team>" preview
+    # URLs for any project named options-trading-*. Override per environment.
+    cors_origin_regex: str = r"https://options-trading.*\.vercel\.app"
     frontend_base_url: str = "http://localhost:3000"
 
     # IBKR Web API (OAuth 1.0a 3rd-party flow). All four are app-level —
