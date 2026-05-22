@@ -91,6 +91,9 @@ const NAV_TRADER = [
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
+  // Per-trade latency breakdown — detection lag, fanout duration, total
+  // end-to-end time. The visible proof of "fast and live" for client demos.
+  { href: "/performance", label: "Performance", Icon: IconBolt },
   { href: "/brokers", label: "Broker", Icon: IconLink },
   // Traders need /settings to toggle master trading, copy_paused, and
   // mirror_external_trades. Previously only NAV_SUBSCRIBER had this link,

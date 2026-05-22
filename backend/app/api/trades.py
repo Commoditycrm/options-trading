@@ -592,3 +592,104 @@ def sync_fills(
         )
     db.commit()
     return result
+
+
+@router.get("/trader/fanout-performance")
+def fanout_performance(
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+    limit: int = Query(default=20, le=100),
+) -> list[dict]:
+    """Trader-only endpoint that powers the Fanout Performance page.
+
+    For each of the trader's most recent fanned-out orders, returns the
+    timing breakdown the client wants to see in the demo:
+      - submitted_at         when Alpaca accepted the trader's order
+      - detected_at          when our backend first recorded the row
+                             (= when the poller saw it; or for UI-placed
+                             orders, when the trader hit the button)
+      - fanout_completed_at  when the last subscriber's order was
+                             submitted at their broker
+      - detection_lag_ms     Alpaca-accept → our detection
+      - fanout_duration_ms   our detection → last subscriber submitted
+      - total_ms             Alpaca-accept → last subscriber submitted
+      - subscribers_targeted count of child orders we tried to place
+      - subscribers_accepted count where the subscriber's broker
+                             accepted the mirror (FILLED / SUBMITTED /
+                             ACCEPTED / PARTIALLY_FILLED)
+      - subscribers_rejected count where the subscriber's broker rejected
+
+    Powers the "Fanout Performance" UI in the trader's account — no extra
+    DB writes, purely a read of existing columns.
+    """
+    # Fetch this trader's most recent orders that were broadcast to
+    # subscribers. parent_order_id IS NULL filters out subscriber mirrors;
+    # fanned_out_to_subscribers=True means we attempted fanout.
+    parents = list(
+        db.execute(
+            select(Order)
+            .options(selectinload(Order.children))
+            .where(
+                Order.user_id == trader.id,
+                Order.parent_order_id.is_(None),
+                Order.fanned_out_to_subscribers.is_(True),
+            )
+            .order_by(Order.created_at.desc())
+            .limit(limit)
+        )
+        .scalars()
+    )
+
+    out: list[dict] = []
+    for p in parents:
+        children = list(p.children or [])
+        # Latest child submitted_at = when fanout "finished" for the
+        # purposes of the demo. NULL submitted_at means that child never
+        # made it to the broker (skipped / errored before submit).
+        child_submits = [c.submitted_at for c in children if c.submitted_at is not None]
+        fanout_completed_at = max(child_submits) if child_submits else None
+
+        # detection_lag = how long between Alpaca accepting the trader's
+        # order and us seeing it (the poll-cycle delay). For external
+        # trades, submitted_at is Alpaca's clock (after the fix); for
+        # UI-placed orders submitted_at and created_at are essentially
+        # the same so detection_lag will be ~0.
+        det_lag_ms = None
+        if p.submitted_at and p.created_at:
+            det_lag_ms = max(0, int((p.created_at - p.submitted_at).total_seconds() * 1000))
+
+        # fanout_duration = our detection -> last subscriber submitted
+        fanout_ms = None
+        if fanout_completed_at and p.created_at:
+            fanout_ms = max(0, int((fanout_completed_at - p.created_at).total_seconds() * 1000))
+
+        total_ms = None
+        if fanout_completed_at and p.submitted_at:
+            total_ms = max(0, int((fanout_completed_at - p.submitted_at).total_seconds() * 1000))
+
+        accepted_statuses = {
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACCEPTED,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+        }
+        sub_accepted = sum(1 for c in children if c.status in accepted_statuses)
+        sub_rejected = sum(1 for c in children if c.status == OrderStatus.REJECTED)
+
+        out.append({
+            "order_id": str(p.id),
+            "symbol": p.symbol,
+            "side": p.side.value,
+            "quantity": str(p.quantity),
+            "instrument_type": p.instrument_type.value,
+            "submitted_at": p.submitted_at.isoformat() if p.submitted_at else None,
+            "detected_at": p.created_at.isoformat() if p.created_at else None,
+            "fanout_completed_at": fanout_completed_at.isoformat() if fanout_completed_at else None,
+            "detection_lag_ms": det_lag_ms,
+            "fanout_duration_ms": fanout_ms,
+            "total_ms": total_ms,
+            "subscribers_targeted": len(children),
+            "subscribers_accepted": sub_accepted,
+            "subscribers_rejected": sub_rejected,
+        })
+    return out

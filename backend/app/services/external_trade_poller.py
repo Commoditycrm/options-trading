@@ -114,13 +114,37 @@ def _handle_external_order(
     """Mirror of alpaca_stream._maybe_handle_external_order — but called
     from a sync poll loop rather than an async WebSocket handler. Same
     gate checks already done by the caller (mirror_external_trades=True,
-    trading_enabled=True, not in DB)."""
+    trading_enabled=True, not in DB).
+
+    Stores Alpaca's reported submitted_at (when the broker accepted the
+    order, not our detection time) so the trader's Fanout Performance UI
+    can compute "detection lag" = our_row.created_at - submitted_at.
+    """
     symbol = str(getattr(raw_order, "symbol", "") or "").upper()
     if not symbol:
         return None
     qty = _dec(getattr(raw_order, "qty", None))
     if qty <= 0:
         return None
+
+    # Parse Alpaca's submitted_at — the authoritative "when broker
+    # accepted" timestamp. Falls back to our clock if parsing fails.
+    alpaca_submitted = getattr(raw_order, "submitted_at", None)
+    submitted_dt: datetime | None = None
+    if alpaca_submitted is not None:
+        try:
+            if isinstance(alpaca_submitted, datetime):
+                submitted_dt = alpaca_submitted
+            else:
+                submitted_dt = datetime.fromisoformat(
+                    str(alpaca_submitted).replace("Z", "+00:00"),
+                )
+            if submitted_dt.tzinfo is None:
+                submitted_dt = submitted_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            submitted_dt = None
+    if submitted_dt is None:
+        submitted_dt = datetime.now(timezone.utc)
 
     # OCC option symbol heuristic (same as the WebSocket path).
     instrument = InstrumentType.STOCK
@@ -156,7 +180,11 @@ def _handle_external_order(
         stop_price=_dec_or_none(getattr(raw_order, "stop_price", None)),
         status=OrderStatus.SUBMITTED,
         broker_order_id=broker_oid,
-        submitted_at=datetime.now(timezone.utc),
+        # Alpaca's timestamp, not ours — lets the UI compute detection lag
+        # as (created_at - submitted_at). created_at is auto-set by the
+        # TimestampMixin to the moment we INSERT, which is essentially
+        # the moment we detected the trade.
+        submitted_at=submitted_dt,
         fanned_out_to_subscribers=True,
     )
     db.add(order)
