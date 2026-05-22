@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +9,22 @@ from app.api import auth, brokers, events, options, positions, settings, subscri
 from app.config import get_settings
 from app.services import alpaca_stream, fanout_stream
 from app.services import events as events_bus
+
+# Python's root logger defaults to WARNING, which silences every log.info()
+# call in our modules (alpaca_stream, fanout_stream, copy_engine, etc.).
+# Bump to INFO so Render's Logs tab shows the activity we actually want to
+# see: stream connect/disconnect, external-trade detection, fanout dispatch,
+# per-subscriber copy.submitted / copy.error events.
+# Set LOG_LEVEL=DEBUG in the Render env for even more detail.
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+# Quieten the noisier libraries — alpaca-py and httpx log at INFO with every
+# HTTP call, which would drown out our application events.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("alpaca").setLevel(logging.WARNING)
 
 DISCLAIMER = (
     "Educational software. Not investment advice. Copy trading involves substantial risk "
