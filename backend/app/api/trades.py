@@ -676,6 +676,41 @@ def fanout_performance(
         sub_accepted = sum(1 for c in children if c.status in accepted_statuses)
         sub_rejected = sum(1 for c in children if c.status == OrderStatus.REJECTED)
 
+        # Per-subscriber breakdown for the expandable row. Sort by
+        # submitted_at so the demo timeline reads in order.
+        sub_user_ids = {c.user_id for c in children}
+        subs_by_id: dict = {}
+        if sub_user_ids:
+            for u in db.execute(
+                select(User.id, User.email, User.display_name).where(User.id.in_(sub_user_ids))
+            ).all():
+                subs_by_id[u.id] = {"email": u.email, "display_name": u.display_name}
+
+        # Sort by submitted_at (then created_at) so the demo timeline reads
+        # in order. Use a tz-aware sentinel for None so we don't mix naive
+        # and aware datetimes during comparison.
+        _SENTINEL = datetime.max.replace(tzinfo=timezone.utc)
+        subscribers_rows: list[dict] = []
+        for c in sorted(children, key=lambda x: (x.submitted_at or x.created_at or _SENTINEL)):
+            u_info = subs_by_id.get(c.user_id, {})
+            child_lag_ms = None
+            if c.submitted_at and p.created_at:
+                child_lag_ms = max(0, int((c.submitted_at - p.created_at).total_seconds() * 1000))
+            subscribers_rows.append({
+                "child_order_id": str(c.id),
+                "user_id": str(c.user_id),
+                "email": u_info.get("email"),
+                "display_name": u_info.get("display_name"),
+                "status": c.status.value,
+                "broker_order_id": c.broker_order_id,
+                "quantity": str(c.quantity),
+                "filled_quantity": str(c.filled_quantity or 0),
+                "child_created_at": c.created_at.isoformat() if c.created_at else None,
+                "child_submitted_at": c.submitted_at.isoformat() if c.submitted_at else None,
+                "subscriber_lag_ms": child_lag_ms,
+                "reject_reason": c.reject_reason,
+            })
+
         out.append({
             "order_id": str(p.id),
             "symbol": p.symbol,
@@ -691,5 +726,6 @@ def fanout_performance(
             "subscribers_targeted": len(children),
             "subscribers_accepted": sub_accepted,
             "subscribers_rejected": sub_rejected,
+            "subscribers": subscribers_rows,
         })
     return out
