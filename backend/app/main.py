@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import auth, brokers, events, options, positions, settings, subscribers, trades
 from app.config import get_settings
-from app.services import alpaca_stream, fanout_stream
+from app.services import alpaca_stream, external_trade_poller, fanout_stream
 from app.services import events as events_bus
 
 # Python's root logger defaults to WARNING, which silences every log.info()
@@ -67,7 +67,30 @@ def create_app() -> FastAPI:
         # Real-time trade-update WebSocket per connected Alpaca account.
         # Fills land in the DB + SSE within ~100ms of execution instead of
         # waiting for the frontend to poll sync-fills.
+        #
+        # NOTE: as of alpaca-py 0.33, this stream silently fails to deliver
+        # events in our background-thread context. external_trade_poller
+        # below is the working fallback (REST polling every 2s). Both run
+        # — they dedupe via broker_order_id, so whichever sees the trade
+        # first wins.
         await alpaca_stream.start_all_streams()
+
+    @app.on_event("startup")
+    async def _start_external_trade_poller() -> None:
+        # REST-polling fallback for external-trade detection. Hits Alpaca's
+        # /v2/orders endpoint every 2 seconds for each trader account with
+        # mirror_external_trades=True, picks up new orders that aren't
+        # already in our DB, dispatches fanout via the same Redis Streams
+        # path as the WebSocket would have.
+        #
+        # Latency: 1-2 seconds (vs ~100ms for working WebSocket).
+        # Always-on so the platform doesn't depend on the WebSocket health.
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, external_trade_poller.poll_loop)
+        import logging
+        logging.getLogger("uvicorn").info(
+            "started external_trade_poller (REST fallback for trade-update WS)",
+        )
 
     @app.on_event("shutdown")
     async def _stop_alpaca_streams() -> None:
