@@ -273,11 +273,35 @@ def _poll_one_account(account_id: uuid.UUID) -> int:
                 order = _handle_external_order(db, acct, owner, raw_order, broker_oid)
                 if order is not None:
                     processed += 1
+
+                    # Latency measurement: time from Alpaca accepting the
+                    # order (submitted_at on the order object) to us
+                    # detecting + dispatching it. This is the headline
+                    # number we quote to the client — "trade in Alpaca
+                    # → fanout dispatched in X seconds".
+                    submitted_at = getattr(raw_order, "submitted_at", None)
+                    lag_str = "?"
+                    if submitted_at is not None:
+                        try:
+                            if isinstance(submitted_at, str):
+                                submitted_dt = datetime.fromisoformat(
+                                    submitted_at.replace("Z", "+00:00"),
+                                )
+                            else:
+                                submitted_dt = submitted_at
+                            if submitted_dt.tzinfo is None:
+                                submitted_dt = submitted_dt.replace(tzinfo=timezone.utc)
+                            lag = (datetime.now(timezone.utc) - submitted_dt).total_seconds()
+                            lag_str = f"{lag:.2f}s"
+                        except Exception:  # noqa: BLE001
+                            lag_str = "?"
+
                     log.info(
-                        "external_trade_poller: handled external order acct=%s symbol=%s broker_oid=%s",
+                        "external_trade_poller: handled external order acct=%s symbol=%s broker_oid=%s lag=%s",
                         account_id,
                         str(getattr(raw_order, "symbol", "?")),
                         broker_oid,
+                        lag_str,
                     )
             except Exception:  # noqa: BLE001
                 log.exception("external_trade_poller: handler error acct=%s broker_oid=%s",
