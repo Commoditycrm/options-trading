@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
@@ -71,32 +71,43 @@ def unread_count(
     return {"unread": int(count)}
 
 
-@router.post("/{notification_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/{notification_id}/read")
 def mark_read(
     notification_id: uuid.UUID,
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
-) -> None:
+) -> dict:
     """Mark a single notification as read. 404 if it doesn't belong to
-    the caller (prevents leaking IDs across users)."""
+    the caller (prevents leaking IDs across users).
+
+    Returns {"ok": true}. (We deliberately don't use status_code=204
+    here — FastAPI 0.115's APIRoute asserts that 204 endpoints have
+    no response body, and a `-> None` annotation triggers that assert
+    at import time. Empty 200 is more portable across versions.)
+    """
     n = db.get(Notification, notification_id)
     if n is None or n.user_id != user.id:
         raise HTTPException(404, "not_found")
     if n.read_at is None:
         n.read_at = datetime.now(timezone.utc)
         db.commit()
+    return {"ok": True}
 
 
-@router.post("/read-all", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/read-all")
 def mark_all_read(
     db: Session = Depends(get_db),
     user: User = Depends(current_user),
-) -> None:
+) -> dict:
     """Mark every unread notification for the caller as read. Used by
-    the inbox's "Mark all read" button."""
-    db.execute(
+    the inbox's "Mark all read" button.
+
+    Returns {"ok": true, "count": <n>}.
+    """
+    result = db.execute(
         update(Notification)
         .where(Notification.user_id == user.id, Notification.read_at.is_(None))
         .values(read_at=datetime.now(timezone.utc))
     )
     db.commit()
+    return {"ok": True, "count": result.rowcount or 0}
