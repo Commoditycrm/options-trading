@@ -63,6 +63,11 @@ _CANCELLABLE_STATUSES = (
     OrderStatus.SUBMITTED,
     OrderStatus.ACCEPTED,
     OrderStatus.PARTIALLY_FILLED,
+    # Cancellation cascade also yanks any subscriber retries waiting to
+    # fire. Without this, trader cancels their own order but subscriber
+    # retries 2 min later → mirror lands on a trade the trader already
+    # backed out of.
+    OrderStatus.RETRY_PENDING,
 )
 
 
@@ -320,6 +325,7 @@ def _place_trader_order(
     background: BackgroundTasks,
     request: Request,
     skip_fanout: bool = False,
+    is_closing: bool = False,
 ) -> Order:
     """Core order-placement flow. Used by /api/trades for trader-originated
     orders (which fan out to subscribers) and by close endpoints. Also reused
@@ -371,6 +377,10 @@ def _place_trader_order(
         stop_price=payload.stop_price,
         status=OrderStatus.PENDING,
         fanned_out_to_subscribers=will_fanout,
+        # Tagged True by close_trade / positions.close-all so subscriber
+        # mirrors inherit the flag and the retry scheduler picks the
+        # right interval (subscriber's retry_interval_close vs _open).
+        is_closing=is_closing,
     )
     db.add(order)
     db.commit()
@@ -509,7 +519,10 @@ def close_trade(
     )
 
     new_order = _place_trader_order(
-        db, user, new_payload, original.broker_account_id, background, request
+        db, user, new_payload, original.broker_account_id, background, request,
+        # Tag as closing so subscribers' mirror retries (if scheduled
+        # later) use retry_interval_close instead of retry_interval_open.
+        is_closing=True,
     )
 
     audit.record(
@@ -570,6 +583,45 @@ def calendar_pnl(
 
     daily = realized_pnl_by_day(db, target_user_id, start=from_, end=to, tz_name=tz)
     return [DailyPnL(day=d, realized_pnl=p, trade_count=n) for d, (p, n) in sorted(daily.items())]
+
+
+@router.post("/trades/{order_id}/cancel-retry", response_model=OrderOut)
+def cancel_retry(
+    order_id: uuid.UUID,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> Order:
+    """Subscriber stops a pending retry on their own mirror order.
+
+    Marks the order REJECTED with reason "retry_cancelled_by_user" and
+    flips retry_attempted=true so the scheduler ignores it. Only the
+    order's owner (the subscriber) can cancel — trader can't cancel
+    individual subscriber retries (cancelling the trader's parent
+    cascades, but that's a separate endpoint).
+    """
+    order = db.execute(
+        select(Order).options(selectinload(Order.fills)).where(Order.id == order_id)
+    ).scalar_one_or_none()
+    if not order or order.user_id != user.id:
+        raise HTTPException(404, "not_found")
+    if order.status != OrderStatus.RETRY_PENDING:
+        raise HTTPException(409, f"not_retry_pending: status is {order.status.value}")
+
+    order.status = OrderStatus.REJECTED
+    order.retry_attempted = True
+    order.reject_reason = "retry_cancelled_by_user"
+    order.closed_at = datetime.now(timezone.utc)
+    audit.record(
+        db, actor_user_id=user.id, action="copy.retry_cancelled",
+        entity_type="order", entity_id=order.id,
+        metadata={"parent_order_id": str(order.parent_order_id) if order.parent_order_id else None},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(order)
+    events.publish(user.id, copy_engine._order_event("order.copy_failed", order))
+    return order
 
 
 @router.post("/trades/sync-fills")

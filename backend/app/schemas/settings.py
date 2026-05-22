@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from pydantic import BaseModel, Field
 
+from app.models.settings import RetryInterval
+
 
 class SubscriberSettingsOut(BaseModel):
     user_id: uuid.UUID
@@ -10,9 +12,21 @@ class SubscriberSettingsOut(BaseModel):
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    # Retry policy. NEVER (default) = no retry on broker-disconnect failures.
+    retry_interval_open: RetryInterval = RetryInterval.NEVER
+    retry_interval_close: RetryInterval = RetryInterval.NEVER
     todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
 
     model_config = {"from_attributes": True}
+
+
+class SubscriberRetryIntervalIn(BaseModel):
+    """Subscriber sets their per-direction retry policy. Sent as TWO
+    fields so the frontend can update them independently (one dropdown
+    per direction in the UI)."""
+
+    retry_interval_open: RetryInterval | None = None
+    retry_interval_close: RetryInterval | None = None
 
 
 class TraderSettingsOut(BaseModel):

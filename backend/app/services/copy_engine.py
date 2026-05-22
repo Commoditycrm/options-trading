@@ -31,7 +31,7 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
@@ -335,6 +335,9 @@ def _process_one_fanout_inner(
         limit_price=trader_order.limit_price,
         stop_price=trader_order.stop_price,
         status=OrderStatus.PENDING,
+        # Propagate the open/close intent from the parent so the retry
+        # scheduler picks the matching interval from subscriber's settings.
+        is_closing=trader_order.is_closing,
     )
     db.add(child)
     db.flush()
@@ -408,6 +411,58 @@ def _process_one_fanout_inner(
             detail=rec.friendly_message[:200],
         )
     except Exception as exc:  # noqa: BLE001
+        # Classify the error. If it's a transient broker-disconnect
+        # (5xx / timeout / connection reset / 429) AND the subscriber
+        # has opted into retry for this open/close direction, schedule
+        # a single retry instead of rejecting immediately. The
+        # retry_scheduler picks this up at retry_at and tries again.
+        from app.services.order_retry import classify_error
+        from app.models.settings import RetryInterval
+
+        cls = classify_error(exc)
+        retry_seconds: int | None = None
+        if cls.transient and not child.retry_attempted:
+            interval: RetryInterval = (
+                sub_settings.retry_interval_close if trader_order.is_closing
+                else sub_settings.retry_interval_open
+            )
+            retry_seconds = interval.seconds()
+
+        if retry_seconds is not None:
+            # Schedule the retry. 0-3s jitter spreads retries across
+            # subscribers so a broker outage doesn't trigger a 100-call
+            # thundering herd at the same second.
+            import random
+            jitter = random.uniform(0, 3)
+            child.status = OrderStatus.RETRY_PENDING
+            child.retry_at = datetime.now(timezone.utc) + timedelta(seconds=retry_seconds + jitter)
+            child.reject_reason = f"transient: {exc}"[:480]
+            audit.record(
+                db,
+                actor_user_id=sub_settings.user_id,
+                action="copy.retry_scheduled",
+                entity_type="order",
+                entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(trader_order.id),
+                    "error": str(exc)[:300],
+                    "retry_at": child.retry_at.isoformat(),
+                    "interval_seconds": retry_seconds,
+                    "is_closing": child.is_closing,
+                },
+            )
+            db.commit()
+            events.publish(sub_settings.user_id, _order_event("order.copy_failed", child))
+            return FanoutResult(
+                subscriber_user_id=sub_settings.user_id,
+                broker_account_id=acct.id,
+                order_id=child.id,
+                status="retry_scheduled",
+                detail=f"retry in {retry_seconds}s",
+            )
+
+        # No retry — either non-transient OR subscriber didn't opt in.
+        # Existing behaviour: mark REJECTED, audit, publish SSE.
         child.status = OrderStatus.REJECTED
         child.reject_reason = str(exc)[:480]
         child.closed_at = datetime.now(timezone.utc)

@@ -9,6 +9,7 @@ from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
     FollowTraderIn,
+    SubscriberRetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
     SubscriberToggleIn,
@@ -35,6 +36,58 @@ def get_subscriber_settings(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        retry_interval_open=s.retry_interval_open,
+        retry_interval_close=s.retry_interval_close,
+        todays_realized_pnl=today_realized_pnl(db, user.id),
+    )
+
+
+@router.patch("/subscriber/retry-intervals", response_model=SubscriberSettingsOut)
+def set_retry_intervals(
+    payload: SubscriberRetryIntervalIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Update one or both of the subscriber's retry intervals. Each
+    field is optional in the request so the frontend can update one
+    dropdown without sending the other.
+
+    Default for both = NEVER (no retry, REJECTED on first failure —
+    the legacy behaviour before this feature shipped)."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old_open = s.retry_interval_open
+    old_close = s.retry_interval_close
+    if payload.retry_interval_open is not None:
+        s.retry_interval_open = payload.retry_interval_open
+    if payload.retry_interval_close is not None:
+        s.retry_interval_close = payload.retry_interval_close
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.retry_intervals_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old_open": old_open.value if hasattr(old_open, "value") else str(old_open),
+            "new_open": s.retry_interval_open.value,
+            "old_close": old_close.value if hasattr(old_close, "value") else str(old_close),
+            "new_close": s.retry_interval_close.value,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    return SubscriberSettingsOut(
+        user_id=s.user_id,
+        following_trader_id=s.following_trader_id,
+        copy_enabled=s.copy_enabled,
+        multiplier=s.multiplier,
+        daily_loss_limit=s.daily_loss_limit,
+        retry_interval_open=s.retry_interval_open,
+        retry_interval_close=s.retry_interval_close,
         todays_realized_pnl=today_realized_pnl(db, user.id),
     )
 
@@ -71,6 +124,8 @@ def set_daily_loss_limit(
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        retry_interval_open=s.retry_interval_open,
+        retry_interval_close=s.retry_interval_close,
         todays_realized_pnl=today_realized_pnl(db, user.id),
     )
 

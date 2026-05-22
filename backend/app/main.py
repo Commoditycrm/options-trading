@@ -5,9 +5,11 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import auth, brokers, events, options, positions, settings, subscribers, trades
+from app.api import (
+    auth, brokers, events, notifications, options, positions, settings, subscribers, trades,
+)
 from app.config import get_settings
-from app.services import alpaca_stream, external_trade_poller, fanout_stream
+from app.services import alpaca_stream, external_trade_poller, fanout_stream, retry_scheduler
 from app.services import events as events_bus
 
 # Python's root logger defaults to WARNING, which silences every log.info()
@@ -64,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(events.router)
     app.include_router(options.router)
     app.include_router(positions.router)
+    app.include_router(notifications.router)
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
@@ -129,9 +132,29 @@ def create_app() -> FastAPI:
             "started %d in-process fanout worker(s)", s.fanout_worker_count,
         )
 
+    @app.on_event("startup")
+    async def _start_retry_scheduler() -> None:
+        # Background loop that re-attempts subscriber mirror orders that
+        # failed with a transient broker-disconnect error. Picks up rows
+        # where status=RETRY_PENDING + retry_at <= now() and tries once.
+        # See services/retry_scheduler.py for details.
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, retry_scheduler.poll_loop)
+        logging.getLogger("uvicorn").info(
+            "started retry_scheduler (interval=%ss)",
+            retry_scheduler.POLL_INTERVAL_SEC,
+        )
+
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True, "disclaimer": DISCLAIMER}
+        return {
+            "ok": True,
+            "disclaimer": DISCLAIMER,
+            # Operational visibility — confirms the retry_scheduler thread
+            # is still ticking. "healthy" flips false if the loop hasn't
+            # run within 3 poll intervals (~30s default).
+            "retry_scheduler": retry_scheduler.heartbeat_status(),
+        }
 
     return app
 

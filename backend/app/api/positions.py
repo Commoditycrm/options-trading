@@ -139,6 +139,7 @@ def close_all_positions(
                 order = _place_trader_order(
                     db, user, payload, acct.id, background, request,
                     skip_fanout=skip_fanout,
+                    is_closing=True,   # close-all is closing, always
                 )
                 closed.append({
                     "broker_account_id": str(acct.id),
@@ -217,4 +218,8 @@ def close_position(
         option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
     )
 
-    return _place_trader_order(db, user, new_payload, acct.id, background, request)
+    # Single-position close — same is_closing semantics as close-all.
+    return _place_trader_order(
+        db, user, new_payload, acct.id, background, request,
+        is_closing=True,
+    )
