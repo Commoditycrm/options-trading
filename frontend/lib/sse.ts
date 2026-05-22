@@ -12,7 +12,19 @@ export type AppEvent =
   // an order's state (fill / partial_fill / accepted / rejected / expired /
   // canceled). Lets the UI reflect fills in real time instead of waiting
   // for the next sync-fills poll.
-  | { type: "order.updated"; order: OrderEventPayload };
+  | { type: "order.updated"; order: OrderEventPayload }
+  // Persistent in-app notification fired when a subscriber's mirror retry
+  // exhausts. UI shows a toast immediately and bumps the bell-icon badge.
+  | {
+      type: "notification.created";
+      notification: {
+        id: string;
+        type: string;
+        message: string;
+        metadata: Record<string, unknown>;
+        created_at: string;
+      };
+    };
 
 export interface OrderEventPayload {
   id: string;

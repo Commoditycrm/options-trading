@@ -33,9 +33,18 @@ export type OrderSide = "buy" | "sell";
 export type OrderType = "market" | "limit" | "stop" | "stop_limit";
 export type OrderStatus =
   | "pending" | "submitted" | "accepted" | "partially_filled"
-  | "filled" | "canceled" | "rejected" | "expired";
+  | "filled" | "canceled" | "rejected" | "expired"
+  // New: first attempt failed with a transient broker-disconnect error
+  // and the subscriber opted into retry. Scheduler will try once more
+  // at retry_at; if that also fails the order moves to "rejected".
+  | "retry_pending";
 export type InstrumentType = "stock" | "option";
 export type OptionRight = "call" | "put";
+
+// Subscriber's per-direction retry interval. NEVER = no retry, REJECT on
+// first failure (legacy behaviour). Minute values = single retry attempt
+// at that delay.
+export type RetryInterval = "never" | "1m" | "2m" | "3m" | "5m";
 
 export interface Fill {
   quantity: string;
@@ -70,6 +79,17 @@ export interface Order {
    *  False for subscribers' orders, trader orders placed while copy was
    *  paused, and trader orders placed with the "Just me" scope. */
   fanned_out_to_subscribers?: boolean;
+  /** True for orders created by close_trade / positions/close-all (or
+   *  inherited from a closing parent). Picks subscriber's
+   *  retry_interval_close instead of _open when retry is scheduled. */
+  is_closing?: boolean;
+  /** When the retry scheduler will attempt this order again. NULL = no
+   *  retry pending. Status RETRY_PENDING + retry_at in the future = the
+   *  UI should render a countdown badge. */
+  retry_at?: string | null;
+  /** True after the single retry attempt has been made (success or
+   *  fail). The scheduler never retries an order twice. */
+  retry_attempted?: boolean;
   fills: Fill[];
 }
 
@@ -101,10 +121,25 @@ export interface SubscriberSettings {
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;
+  /** Retry policy when a mirror order fails with a transient (broker-
+   *  disconnect) error. NEVER = REJECT immediately on first failure. */
+  retry_interval_open: RetryInterval;
+  retry_interval_close: RetryInterval;
   todays_realized_pnl: string | null;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
   trader_paused?: boolean;
+}
+
+/** Persistent in-app notification (bell icon + inbox page).
+ *  Today the only type is "copy.retry_failed". */
+export interface AppNotification {
+  id: string;
+  type: string;
+  message: string;
+  metadata: Record<string, unknown>;
+  read_at: string | null;
+  created_at: string;
 }
 
 export interface TraderSettings {

@@ -4,8 +4,18 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
+import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import type { SubscriberSettings, User } from "@/lib/types";
+
+function IconBell() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+    </svg>
+  );
+}
 
 interface BulkCopyState { total: number; enabled: number; paused: boolean; }
 
@@ -140,6 +150,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Subscriber-only personal copy switch (same UX, different endpoint).
   const [subCopy, setSubCopy] = useState<SubscriberSettings | null>(null);
   const [subCopyBusy, setSubCopyBusy] = useState(false);
+  // Notification bell badge count. Both roles get one (today only
+  // subscribers receive notifications, but the bell is universal so
+  // future trader-side notifications work without UI changes).
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+
+  async function refreshUnreadCount() {
+    try {
+      const r = await api<{ unread: number }>("/api/notifications/unread-count");
+      setUnreadCount(r.unread);
+    } catch { /* tolerate — bell just doesn't show a badge */ }
+  }
 
   useEffect(() => {
     if (!getAccessToken()) { router.replace("/login"); return; }
@@ -159,6 +180,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         } else {
           api<SubscriberSettings>("/api/settings/subscriber").then(setSubCopy).catch(() => {});
         }
+        // Hydrate bell badge for both roles. Subscribers get
+        // copy.retry_failed notifications; the table is generic so
+        // future trader-facing notification types will land here too.
+        refreshUnreadCount();
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) {
@@ -169,6 +194,17 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       })
       .finally(() => setLoading(false));
   }, [router]);
+
+  // Real-time bell badge update — when the backend pushes a new
+  // notification SSE event, bump the count immediately AND show a toast
+  // so the user sees something happened even if they're on a different
+  // page than the inbox.
+  useEventStream((evt) => {
+    if (evt.type === "notification.created") {
+      setUnreadCount(c => c + 1);
+      notify.warn(evt.notification.message, { autoClose: 8000 });
+    }
+  });
 
   async function toggleSubscriberCopy() {
     if (!subCopy) return;
@@ -264,6 +300,41 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               {user.role}
             </div>
           </div>
+        </div>
+
+        {/* Notification bell — sits above the nav, visible to both roles. */}
+        <div className="px-3 pb-2">
+          <a
+            href="/notifications"
+            onClick={(e) => {
+              if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+              e.preventDefault();
+              if (pathname !== "/notifications") router.push("/notifications");
+            }}
+            className="flex items-center gap-2.5 px-4 py-2.5 rounded-full text-sm transition-colors no-underline relative"
+            style={{
+              background: pathname?.startsWith("/notifications")
+                ? "linear-gradient(90deg, rgba(10,115,168,0.16), rgba(10,115,168,0.04))"
+                : "transparent",
+              color: pathname?.startsWith("/notifications") ? "var(--accent)" : "var(--text-2)",
+              fontWeight: pathname?.startsWith("/notifications") ? 600 : 500,
+              border: pathname?.startsWith("/notifications")
+                ? "1px solid rgba(10,115,168,0.30)"
+                : "1px solid transparent",
+            }}
+          >
+            <IconBell />
+            <span>Notifications</span>
+            {unreadCount > 0 && (
+              <span
+                className="ml-auto inline-flex items-center justify-center min-w-5 h-5 px-1.5 rounded-full text-[10px] font-bold"
+                style={{ background: "var(--bad)", color: "white" }}
+                title={`${unreadCount} unread notification${unreadCount === 1 ? "" : "s"}`}
+              >
+                {unreadCount > 99 ? "99+" : unreadCount}
+              </span>
+            )}
+          </a>
         </div>
 
         {/* Nav — scrolls within sidebar if it ever overflows */}

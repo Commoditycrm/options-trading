@@ -214,6 +214,21 @@ export default function TradesPage() {
     }
   }
 
+  /** Stop a pending retry on the subscriber's own mirror order. Different
+   *  endpoint from cancelOrder because the order never reached the broker. */
+  async function cancelRetry(id: string) {
+    setActingFor({ id, kind: "cancel" });
+    try {
+      const updated = await api<Order>(`/api/trades/${id}/cancel-retry`, { method: "POST" });
+      setOrders(cur => cur.map(o => o.id === id ? updated : o));
+      notify.success(`Retry cancelled: ${updated.symbol}`);
+    } catch (e) {
+      notify.fromError(e, "cancel-retry failed");
+    } finally {
+      setActingFor(null);
+    }
+  }
+
   /** One-shot close: type=market → fires immediately, type=limit → uses the
    *  per-row price input. */
   async function closeAt(id: string, type: "market" | "limit") {
@@ -420,6 +435,7 @@ export default function TradesPage() {
               const isFilled = o.status === "filled";
               const isMine = !o.parent_order_id;     // own order (not a mirror)
               const canCancel = isOpen;
+              const canCancelRetry = o.status === "retry_pending";
               // No more Close buttons in Order History — close lives on the
               // Trade Panel's Open Positions table now.
               const canClose = false;
@@ -455,6 +471,18 @@ export default function TradesPage() {
                             className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5"
                           >
                             <span>Cancel</span>
+                            {actingFor?.id === o.id && actingFor.kind === "cancel" && <Spinner />}
+                          </button>
+                        )}
+
+                        {canCancelRetry && (
+                          <button
+                            disabled={actingFor?.id === o.id}
+                            onClick={() => cancelRetry(o.id)}
+                            className="btn-danger-soft px-3 py-1 text-xs inline-flex items-center gap-1.5"
+                            title="Stop the scheduled retry. The order will be marked rejected."
+                          >
+                            <span>Cancel retry</span>
                             {actingFor?.id === o.id && actingFor.kind === "cancel" && <Spinner />}
                           </button>
                         )}
@@ -503,7 +531,7 @@ export default function TradesPage() {
                           </>
                         )}
 
-                        {!canCancel && !canClose && (
+                        {!canCancel && !canClose && !canCancelRetry && (
                           <span className="text-xs" style={{ color: "var(--faint)" }}>—</span>
                         )}
                       </div>
@@ -525,18 +553,28 @@ export default function TradesPage() {
                         className="text-[11px] uppercase tracking-wider px-2 py-[4px] rounded whitespace-nowrap font-medium"
                         style={{
                           background:
-                            o.status === "filled"     ? "var(--good-soft)" :
-                            o.status === "rejected"   ? "var(--bad-soft)"  :
-                            o.status === "canceled"   ? "rgba(255,255,255,0.04)" :
-                                                        "rgba(10,115,168,0.10)",
+                            o.status === "filled"        ? "var(--good-soft)" :
+                            o.status === "rejected"      ? "var(--bad-soft)"  :
+                            o.status === "retry_pending" ? "rgba(217,119,6,0.12)" :
+                            o.status === "canceled"      ? "rgba(255,255,255,0.04)" :
+                                                           "rgba(10,115,168,0.10)",
                           color:
-                            o.status === "filled"     ? "var(--good)" :
-                            o.status === "rejected"   ? "var(--bad)"  :
-                            o.status === "canceled"   ? "var(--muted)" :
-                                                        "var(--accent)",
+                            o.status === "filled"        ? "var(--good)" :
+                            o.status === "rejected"      ? "var(--bad)"  :
+                            o.status === "retry_pending" ? "var(--amber, #d97706)" :
+                            o.status === "canceled"      ? "var(--muted)" :
+                                                           "var(--accent)",
                         }}
+                        title={
+                          o.status === "retry_pending" && o.retry_at
+                            ? `Next retry: ${new Date(o.retry_at).toLocaleString(undefined, {
+                                hour: "2-digit", minute: "2-digit", second: "2-digit",
+                              })}`
+                            : undefined
+                        }
                       >
-                        {o.status}{o.parent_order_id ? " · copy" : ""}
+                        {o.status === "retry_pending" ? "retry pending" : o.status}
+                        {o.parent_order_id ? " · copy" : ""}
                       </span>
                     </td>
                     {/* Submitted at — fallback to created_at for orders that
