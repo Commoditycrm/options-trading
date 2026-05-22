@@ -462,25 +462,40 @@ async def _run_stream_for_account(account_id: uuid.UUID) -> None:
             )
 
             # The handler must be async; we keep the DB work sync inside it.
+            # Log every received event up front so we can confirm the WebSocket
+            # is actually delivering data, separate from whether the downstream
+            # processing succeeds.
             async def _handler(data: Any) -> None:
                 try:
+                    evt = str(getattr(data, "event", "?"))
+                    raw = getattr(data, "order", None)
+                    sym = str(getattr(raw, "symbol", "?")) if raw is not None else "?"
+                    log.info("alpaca_stream: trade_update event=%s symbol=%s acct=%s",
+                             evt, sym, account_id)
                     _apply_trade_update(account_id, data)
                 except Exception:  # noqa: BLE001
                     log.exception("alpaca_stream: handler error acct=%s", account_id)
 
             stream.subscribe_trade_updates(_handler)
-            log.info("alpaca_stream: connected acct=%s paper=%s", account_id, creds.get("paper", True))
+            log.info("alpaca_stream: subscribed acct=%s paper=%s — starting run loop",
+                     account_id, creds.get("paper", True))
 
-            # _run_forever is the awaitable inner loop; .run() blocks via asyncio.run()
-            # which we can't call from inside an existing loop. Use the SDK's
-            # internal coroutine when available, otherwise fall back to to_thread.
-            if hasattr(stream, "_run_forever"):
-                await stream._run_forever()
-            else:
-                await asyncio.to_thread(stream.run)
+            # Use the documented public API: stream.run() — it internally
+            # calls asyncio.run(self._run_forever()), which creates a fresh
+            # event loop. We isolate that into a thread via asyncio.to_thread
+            # so it doesn't fight with the FastAPI loop.
+            #
+            # Earlier this code branched on hasattr(stream, "_run_forever")
+            # and awaited it directly when present. In alpaca-py 0.33 that
+            # method exists but doesn't return until cancelled in some flows
+            # AND in others returns immediately without raising — leaving us
+            # in a "connected but receiving nothing" state with no error.
+            # asyncio.to_thread(stream.run) is the SDK's recommended path
+            # and is the only one we've confirmed actually delivers events.
+            log.info("alpaca_stream: run loop starting in thread acct=%s", account_id)
+            await asyncio.to_thread(stream.run)
 
-            # If _run_forever returns cleanly, treat as graceful disconnect and reconnect.
-            log.info("alpaca_stream: disconnected acct=%s, reconnecting", account_id)
+            log.info("alpaca_stream: run loop returned cleanly acct=%s, reconnecting", account_id)
             backoff = _RECONNECT_MIN_SECONDS
 
         except asyncio.CancelledError:
