@@ -496,14 +496,43 @@ async def _run_stream_for_account(account_id: uuid.UUID) -> None:
 
 
 def start_stream(account_id: uuid.UUID) -> None:
-    """Launch the stream task for one account. No-op if already running."""
+    """Launch the stream task for one account. No-op if already running.
+
+    Safe to call from BOTH async contexts (the FastAPI startup event) and
+    sync contexts (the POST /api/brokers endpoint, which is sync because
+    FastAPI runs sync endpoints in a thread pool). We achieve this by
+    scheduling the coroutine onto the asyncio loop that was bound to the
+    in-memory event bus at app startup, via run_coroutine_threadsafe.
+
+    Earlier versions used asyncio.create_task() which only works from
+    inside the running loop — calling it from a sync HTTP endpoint
+    raised RuntimeError("no running event loop"), which the connect-
+    side try/except swallowed silently. Net effect: brokers connected
+    after app startup never got a trade-update WebSocket.
+    """
     if account_id in _streams and not _streams[account_id].done():
         return
-    task = asyncio.create_task(
-        _run_stream_for_account(account_id),
-        name=f"alpaca_stream:{account_id}",
+
+    # Local import to avoid an import cycle (events_bus is imported by main.py
+    # which imports the broker router which uses this function).
+    from app.services import events as events_bus
+
+    loop = events_bus._loop
+    if loop is None:
+        log.warning(
+            "alpaca_stream.start_stream(%s) called before the event loop "
+            "was bound — stream not started",
+            account_id,
+        )
+        return
+
+    # Works from any thread. Returns a concurrent.futures.Future — supports
+    # .cancel() and .done() the same way asyncio.Task does, so stop_stream()
+    # and the "already running" check above still work.
+    fut = asyncio.run_coroutine_threadsafe(
+        _run_stream_for_account(account_id), loop,
     )
-    _streams[account_id] = task
+    _streams[account_id] = fut
 
 
 def stop_stream(account_id: uuid.UUID) -> None:
