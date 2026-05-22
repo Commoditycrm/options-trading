@@ -92,6 +92,10 @@ const NAV_TRADER = [
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
   { href: "/brokers", label: "Broker", Icon: IconLink },
+  // Traders need /settings to toggle master trading, copy_paused, and
+  // mirror_external_trades. Previously only NAV_SUBSCRIBER had this link,
+  // which left the trader-side toggles reachable only via direct URL.
+  { href: "/settings", label: "Settings", Icon: IconSettings },
 ];
 const NAV_SUBSCRIBER = [
   { href: "/positions", label: "Positions", Icon: IconLayers },
