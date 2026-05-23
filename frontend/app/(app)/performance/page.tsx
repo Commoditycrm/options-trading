@@ -428,6 +428,131 @@ function SubscriberPill({ counts }: { counts: SubscriberCounts }) {
   );
 }
 
+/**
+ * Client-friendly per-trade summary shown above the per-subscriber table.
+ *
+ * Why this exists
+ * ---------------
+ * The parent row's `Total` column shows max(subscriber_lag) — one slow
+ * subscriber can make a trade where 99% of mirrors landed in <1 s look
+ * like it "took 15 seconds." That's accurate but easy to misread as a
+ * platform-wide slowness. This card surfaces the *distribution* (p50,
+ * % under 1 s) and names the slowest subscriber as a specific outlier
+ * — so the reader sees both the typical experience and the worst case,
+ * with attribution.
+ *
+ * Uses `subscriber_lag_ms` (parent detected → broker accepted) as the
+ * per-subscriber latency, NOT `publish_lag_ms`. The latter is browser
+ * notification lag and isn't part of the actual trade timing.
+ */
+function TradeSummaryCard({ mirrors }: { mirrors: FanoutChild[] }) {
+  // Pull the per-subscriber trade latencies. Subscribers whose mirror
+  // never reached the broker (rejected up front) have null lag — we
+  // count them separately as "errored" rather than mixing them into
+  // the latency distribution.
+  const lags: number[] = [];
+  const slowest: { ms: number; name: string | null } = { ms: -1, name: null };
+  let errored = 0;
+
+  for (const c of mirrors) {
+    if (c.subscriber_lag_ms === null || c.subscriber_lag_ms === undefined) {
+      errored += 1;
+      continue;
+    }
+    lags.push(c.subscriber_lag_ms);
+    if (c.subscriber_lag_ms > slowest.ms) {
+      slowest.ms = c.subscriber_lag_ms;
+      slowest.name = c.subscriber_name
+        || (c.subscriber_email ? c.subscriber_email.split("@")[0] : null);
+    }
+  }
+
+  const placedCount = lags.length;
+  const under1s = lags.filter(l => l <= 1000).length;
+  // Median: sort + pick middle. Skip when we have no samples.
+  let median: number | null = null;
+  if (lags.length > 0) {
+    const sorted = [...lags].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    median = sorted.length % 2 === 0
+      ? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+      : sorted[mid];
+  }
+
+  // Headline: % under 1 s when most subs placed at all.
+  const pctUnder1s = placedCount > 0
+    ? Math.round((under1s / placedCount) * 100)
+    : 0;
+
+  // For the slowest line we try to attribute the cause: an errored
+  // subscriber didn't pick a broker call at all (likely a rejection),
+  // so it's not a "slow Alpaca call" — distinguish.
+  const slowestCause = slowest.ms >= 0
+    ? (slowest.ms >= 5000
+        ? "broker account slow / rate-limited"
+        : slowest.ms >= 1000
+          ? "broker call slow"
+          : "normal")
+    : "";
+
+  return (
+    <div
+      className="mb-3 rounded-lg border px-4 py-3"
+      style={{
+        borderColor: "var(--border)",
+        background: "linear-gradient(180deg, rgba(34,197,94,0.06) 0%, rgba(0,0,0,0) 100%)",
+      }}
+    >
+      <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: "var(--muted)" }}>
+        Trade summary
+      </div>
+      <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm">
+        {/* Headline: how many subs got placed quickly. */}
+        <div>
+          <span style={{ color: pctUnder1s >= 90 ? "var(--good)" : "var(--warn)", fontWeight: 600 }}>
+            {under1s} of {placedCount}
+          </span>
+          <span style={{ color: "var(--muted)" }}> subscribers placed within 1 second</span>
+          {placedCount > 0 && (
+            <span style={{ color: "var(--muted)" }}> ({pctUnder1s}%)</span>
+          )}
+        </div>
+        {/* Median latency — the "typical" subscriber experience. */}
+        {median !== null && (
+          <div>
+            <span style={{ color: "var(--muted)" }}>Median: </span>
+            <span style={{ color: colorFor(median), fontWeight: 600 }}>{fmtMs(median)}</span>
+          </div>
+        )}
+        {/* Slowest as a named outlier with attribution. */}
+        {slowest.ms >= 0 && (
+          <div>
+            <span style={{ color: "var(--muted)" }}>Slowest: </span>
+            <span style={{ color: colorFor(slowest.ms), fontWeight: 600 }}>
+              {fmtMs(slowest.ms)}
+            </span>
+            {slowest.name && (
+              <span style={{ color: "var(--muted)" }}> ({slowest.name}{slowestCause !== "normal" ? ` — ${slowestCause}` : ""})</span>
+            )}
+          </div>
+        )}
+        {/* Errors (credentials, etc.) — separated from latency stats. */}
+        {errored > 0 && (
+          <div>
+            <span style={{ color: "var(--bad)", fontWeight: 600 }}>{errored} errored</span>
+            <span style={{ color: "var(--muted)" }}> (e.g. credential issues — see Reject Reason)</span>
+          </div>
+        )}
+      </div>
+      <div className="mt-2 text-[11px]" style={{ color: "var(--muted)" }}>
+        Note: per-subscriber timings below show <b>trade latency</b> (Subscriber Lag). The
+        separate <b>UI Notification Lag</b> column is when the subscriber&apos;s browser
+        received the SSE update — independent of when their order was actually placed.
+      </div>
+    </div>
+  );
+}
+
 export default function PerformancePage() {
   const [data, setData] = useState<FanoutResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -648,7 +773,7 @@ export default function PerformancePage() {
                 ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
                 ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
                 ["Socket Lag", "Trader submit → our WebSocket hearing about it. Socket Received At − Trader Submitted At."],
-                ["Publish Lag", "Detection → SSE broadcast. Redis Published At − Detected At."],
+                ["UI Notification Lag", "Detection → SSE broadcast to the trader's browser. Redis Published At − Detected At. NOTE: this is the browser-update step, NOT the trade itself. The trade was placed at Broker Accepted At."],
                 ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
                 ["Fanout Duration", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
                 ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
@@ -768,6 +893,12 @@ export default function PerformancePage() {
                     <tr style={{ borderTop: "1px solid var(--border)" }}>
                       <td colSpan={16} className="px-0 py-0" style={{ background: "rgba(0,0,0,0.25)" }}>
                         <div className="px-5 py-4">
+                          {/* Headline summary — the client-friendly framing.
+                              Avoids the "trade took 15.9s" misread by showing
+                              what most subscribers actually experienced (p50,
+                              # placed within 1s) and naming the slowest as a
+                              named outlier rather than a platform stat. */}
+                          {f.children.length > 0 && <TradeSummaryCard mirrors={f.children} />}
                           <div
                             className="text-[10px] uppercase tracking-widest mb-3"
                             style={{ color: "var(--muted)" }}
@@ -799,7 +930,7 @@ export default function PerformancePage() {
                                     ["Pick Lag", "Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
                                     ["Eligibility Lag", "Picked → ready to call broker. Accepted At − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
                                     ["Broker Lag", "Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip."],
-                                    ["Publish Lag", "Broker accept → SSE broadcast. Published At − Broker Accepted At."],
+                                    ["UI Notification Lag", "Broker accept → SSE pushed to subscriber's browser. Published At − Broker Accepted At. NOTE: this is the browser-update step, NOT the trade itself. The order was placed at Broker Accepted At — see Subscriber Lag for the actual per-subscriber trade latency."],
                                     ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
                                     ["Broker Order ID", "Identifier the subscriber's broker assigned to this mirror. Used by support to look up the order on the broker side."],
                                     ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
