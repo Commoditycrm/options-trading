@@ -636,28 +636,36 @@ export default function PerformancePage() {
         <table className="w-full text-sm" style={{ borderCollapse: "separate", borderSpacing: 0 }}>
           <thead>
             <tr style={{ color: "var(--muted)" }}>
-              {[
-                "Symbol",
-                "Side",
-                "Qty",
-                "Trader Submitted At",
-                "Broker Accepted At",
-                "Socket Received At",
-                "Detected At",
-                "Redis Published At",
-                "Fanout Completed At",
-                "API→Broker Lag",
-                "Socket Lag",
-                "Publish Lag",
-                "Detection Lag",
-                "Fanout Duration",
-                "Total",
-                "Subscribers",
-              ].map(h => (
+              {([
+                ["Symbol", "Ticker symbol the trader bought or sold."],
+                ["Side", "BUY or SELL."],
+                ["Qty", "Trader's own order quantity. Each subscriber's mirror is this × their multiplier."],
+                ["Trader Submitted At", "When our backend received the trader's order. For trades placed outside our app (Alpaca dashboard, mobile, broker API), this is the time Alpaca accepted the order."],
+                ["Broker Accepted At", "When the trader's broker (Alpaca) confirmed acceptance of the order."],
+                ["Socket Received At", "When our Alpaca trade-updates WebSocket heard the order event from the broker."],
+                ["Detected At", "When we created the parent Order row in our database — this is the trigger that starts fanout to subscribers."],
+                ["Redis Published At", "When we broadcast the order via SSE so the trader's open browser tabs update in real time."],
+                ["Fanout Completed At", "The latest moment any subscriber's broker accepted their mirror — i.e. max(Submitted At) across all child orders. The 'last subscriber filled' time."],
+                ["API→Broker Lag", "Trader submit → broker accept. Broker Accepted At − Trader Submitted At."],
+                ["Socket Lag", "Trader submit → our WebSocket hearing about it. Socket Received At − Trader Submitted At."],
+                ["Publish Lag", "Detection → SSE broadcast. Redis Published At − Detected At."],
+                ["Detection Lag", "Broker accept → our DB row created. Detected At − Broker Accepted At. Near-zero for orders placed through our Trade Panel; larger for externally-placed trades detected via WebSocket."],
+                ["Fanout Duration", "End-to-end time spent fanning out to every subscriber. Fanout Completed At − Detected At."],
+                ["Total", "Client-facing latency: trader submit → last subscriber's broker accepted. Fanout Completed At − Broker Accepted At."],
+                ["Subscribers", "Total subscribers receiving this trade, with submitted-vs-error counts."],
+              ] as [string, string][]).map(([h, tip]) => (
                 <th
                   key={h}
+                  title={tip}
                   className="text-left px-3 py-3 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
-                  style={{ borderBottom: "1px solid var(--border)" }}
+                  style={{
+                    borderBottom: "1px solid var(--border)",
+                    // Dotted underline + help cursor signals "hover me for an
+                    // explanation" without bloating the header with ? icons.
+                    cursor: "help",
+                    textDecoration: "underline dotted var(--border)",
+                    textUnderlineOffset: 4,
+                  }}
                 >
                   {h}
                 </th>
@@ -777,29 +785,35 @@ export default function PerformancePage() {
                             >
                               <thead>
                                 <tr style={{ color: "var(--muted)" }}>
-                                  {[
-                                    "Subscriber",
-                                    "Status",
-                                    "Qty",
-                                    "Filled Qty",
-                                    "Created At",
-                                    "Picked At",
-                                    "Accepted At",
-                                    "Broker Accepted At",
-                                    "Published At",
-                                    "Submitted At",
-                                    "Pick Lag",
-                                    "Eligibility Lag",
-                                    "Broker Lag",
-                                    "Publish Lag",
-                                    "Subscriber Lag",
-                                    "Broker Order ID",
-                                    "Reject Reason",
-                                  ].map(h => (
+                                  {([
+                                    ["Subscriber", "The subscriber whose account this mirror was placed on."],
+                                    ["Status", "Current state of this mirror order (PENDING / SUBMITTED / FILLED / REJECTED / RETRY_PENDING / etc)."],
+                                    ["Qty", "Mirror quantity — trader's qty × this subscriber's multiplier, rounded per broker rules (floored to whole shares unless the broker supports fractional)."],
+                                    ["Filled Qty", "Quantity actually filled by the subscriber's broker. Less than Qty means a partial fill."],
+                                    ["Created At", "When we inserted this subscriber's child Order row in our database (status=PENDING)."],
+                                    ["Picked At", "When copy_engine started processing this specific subscriber — the per-subscriber starting line."],
+                                    ["Accepted At", "When this subscriber passed every eligibility check (daily-loss limit not hit, copy still enabled, broker available, scaled qty > 0). We're about to call their broker."],
+                                    ["Broker Accepted At", "When this subscriber's broker (Alpaca) confirmed acceptance of the mirror order."],
+                                    ["Published At", "When we broadcast the mirror's outcome via SSE so the subscriber's open tabs update in real time."],
+                                    ["Submitted At", "Broker's own timestamp for when it accepted the order. Usually identical to Broker Accepted At; can differ if the broker's clock is skewed."],
+                                    ["Pick Lag", "Parent detected → this subscriber picked. Picked At − parent Detected At. Grows with the number of subscribers ahead of this one in the fanout queue."],
+                                    ["Eligibility Lag", "Picked → ready to call broker. Accepted At − Picked At. Time spent on gate checks (daily-loss P&L lookup, settings reads)."],
+                                    ["Broker Lag", "Submit → broker accepted. Broker Accepted At − Accepted At. The single broker REST call's round-trip."],
+                                    ["Publish Lag", "Broker accept → SSE broadcast. Published At − Broker Accepted At."],
+                                    ["Subscriber Lag", "Total per-subscriber latency: parent detected → this subscriber's broker accepted. Submitted At − parent Detected At."],
+                                    ["Broker Order ID", "Identifier the subscriber's broker assigned to this mirror. Used by support to look up the order on the broker side."],
+                                    ["Reject Reason", "If REJECTED — short error message (insufficient buying power, after-hours, broker_account_missing, etc). Blank for non-rejected orders."],
+                                  ] as [string, string][]).map(([h, tip]) => (
                                     <th
                                       key={h}
+                                      title={tip}
                                       className="text-left px-2 py-2 text-[10px] uppercase tracking-widest font-medium whitespace-nowrap"
-                                      style={{ borderBottom: "1px solid var(--border)" }}
+                                      style={{
+                                        borderBottom: "1px solid var(--border)",
+                                        cursor: "help",
+                                        textDecoration: "underline dotted var(--border)",
+                                        textUnderlineOffset: 4,
+                                      }}
                                     >
                                       {h}
                                     </th>
