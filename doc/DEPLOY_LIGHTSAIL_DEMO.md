@@ -117,6 +117,32 @@ session lifetime, but for the demo, tuning these two numbers is enough.)
 
 ---
 
+## Seed demo data (no real broker needed)
+
+`scripts/seed_demo.py` creates a trader + N subscribers, each wired to a
+**mock broker** (`app/brokers/mock.py`) that simulates 200-400ms order
+latency with ~3% random failures — so the queue, worker pool, and dashboard
+run end to end without any real broker credentials.
+
+```bash
+# Create 1 trader + 100 subscribers (all password: demo1234)
+docker compose -f docker-compose.demo.yml exec backend python -m scripts.seed_demo --subscribers 100
+
+# Same, AND immediately fire one trader order through the queue fanout
+docker compose -f docker-compose.demo.yml exec backend python -m scripts.seed_demo --subscribers 100 --fire-order
+
+# Wipe all demo data
+docker compose -f docker-compose.demo.yml exec backend python -m scripts.seed_demo --reset
+```
+
+After `--fire-order`, open `/admin/demo` and watch the workers drain the
+queue in real time. You can also log in as `demo-trader@signalboxx.test`
+(password `demo1234`) and place orders from the Trade Panel to generate
+fresh batches on demand.
+
+> The mock broker is gated behind `BrokerName.MOCK` and only created by the
+> seed script — production traders/subscribers are unaffected.
+
 ## Demo talking points (what the dashboard shows)
 
 `/admin/demo` polls `/api/admin/demo/stats` every second and renders:

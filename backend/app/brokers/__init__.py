@@ -7,6 +7,7 @@ from app.brokers.base import (
     ConnectionInfo,
 )
 from app.brokers.ibkr import IbkrAdapter
+from app.brokers.mock import MockAdapter
 from app.models.broker_account import BrokerAccount, BrokerName
 
 
@@ -16,6 +17,8 @@ def adapter_for(broker_account: BrokerAccount, credentials: dict) -> BrokerAdapt
         return AlpacaAdapter(credentials)
     if broker_account.broker == BrokerName.IBKR:
         return IbkrAdapter(credentials)
+    if broker_account.broker == BrokerName.MOCK:
+        return MockAdapter(credentials)
     raise ValueError(f"no adapter for {broker_account.broker}")
 
 
@@ -27,6 +30,7 @@ __all__ = [
     "BrokerPosition",
     "ConnectionInfo",
     "IbkrAdapter",
+    "MockAdapter",
     "adapter_for",
     "build_occ_symbol",
 ]

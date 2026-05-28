@@ -16,6 +16,10 @@ class BrokerName(str, enum.Enum):
     Postgres broker_name enum (see e7c4a9b21d83_add_ibkr_to_broker_name_enum)."""
     ALPACA = "alpaca"
     IBKR = "ibkr"
+    # Demo-only simulated broker (app/brokers/mock.py). Added via migration
+    # e1f2a3b4c5d6. Used by scripts/seed_demo.py so the queue demo runs
+    # without real broker credentials.
+    MOCK = "mock"
 
 
 class BrokerAccount(Base, TimestampMixin):
