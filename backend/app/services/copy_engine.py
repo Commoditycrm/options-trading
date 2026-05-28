@@ -42,6 +42,7 @@ from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
+from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, events
@@ -538,6 +539,53 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
             lambda t: process_one_fanout(trader_order.id, t),
             targets,
         ))
+
+
+# ─── Queue-based fanout (demo) ──────────────────────────────────────────────
+
+def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
+    """Demo replacement for ``fanout``: enumerates eligible subscribers
+    from the in-memory cache and batch-inserts one ``pending_copies`` row
+    per subscriber-broker pair, then returns. NO eligibility checks, NO
+    broker calls in this code path — those happen in the worker pool
+    (services.subscriber_worker).
+
+    Returns the number of rows queued. Target latency: <10ms for 100 subs.
+    """
+    from app.services import memory_cache
+
+    if trader.role != UserRole.TRADER:
+        return 0
+    ts = db.get(TraderSettings, trader.id)
+    if ts is None or not ts.trading_enabled or ts.copy_paused:
+        return 0
+
+    subs = memory_cache.subscribers_for_trader(trader.id)
+    if not subs:
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    for entry in subs:
+        # We still enqueue subscribers with no broker so the worker can
+        # surface a "skipped_no_broker" row in the dashboard. Cheap.
+        if not entry.copy_enabled:
+            continue
+        if entry.following_trader_id != trader.id:
+            continue
+        rows.append({
+            "id": uuid.uuid4(),
+            "parent_order_id": trader_order.id,
+            "subscriber_user_id": entry.user_id,
+            "status": PendingCopyStatus.QUEUED.value,
+        })
+
+    if not rows:
+        return 0
+
+    # Single batch insert. Postgres can chew through 100 rows in ~5ms.
+    db.execute(PendingCopy.__table__.insert(), rows)
+    db.commit()
+    return len(rows)
 
 
 def _order_event(event_type: str, order: Order) -> dict[str, Any]:
