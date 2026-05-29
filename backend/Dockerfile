@@ -9,14 +9,14 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# System deps: psycopg/cryptography wheels are prebuilt, but build-essential
-# keeps us safe if a transitive dep needs to compile.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
+# No apt/build-essential: every dependency (psycopg[binary], cryptography,
+# bcrypt, pandas via webull, snaptrade-python-sdk, …) ships prebuilt
+# manylinux wheels for linux/amd64, so pip needs no compiler. This keeps the
+# image slim and avoids the Debian-mirror DNS dependency at build time.
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+# --timeout/--retries: the webull SDK pulls large transitive wheels (pandas),
+# and slow links can ReadTimeout on the default 15s. Be patient + retry.
+RUN pip install --timeout 120 --retries 5 -r requirements.txt
 
 COPY . .
 

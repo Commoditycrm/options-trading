@@ -116,6 +116,34 @@ def get_subscriber(user_id: uuid.UUID) -> SubscriberCacheEntry | None:
     return None
 
 
+def get_subscriber_or_load(user_id: uuid.UUID) -> SubscriberCacheEntry | None:
+    """Like get_subscriber, but on a cache MISS falls back to loading the
+    subscriber from the DB and populating the cache, instead of treating a
+    miss as 'not following'.
+
+    Why this matters: the cache is process-local and loaded at startup. A
+    subscriber created/changed out-of-band (e.g. by the seed script, a DB
+    import, or simply after this process booted) won't be in this process's
+    cache. Without the fallback a worker would wrongly fail the copy as
+    'copy_disabled'. With it, a cold/stale cache self-heals on first use —
+    the DB stays the source of truth; the cache is just an accelerator."""
+    e = get_subscriber(user_id)
+    if e is not None:
+        return e
+    with SessionLocal() as db:
+        sub = db.get(SubscriberSettings, user_id)
+        if sub is None or sub.following_trader_id is None:
+            return None
+        entry = _build_entry(db, sub)
+    with _lock:
+        bucket = _cache.setdefault(entry.following_trader_id, [])
+        # De-dupe in case a concurrent worker just loaded the same subscriber.
+        _cache[entry.following_trader_id] = [
+            x for x in bucket if x.user_id != user_id
+        ] + [entry]
+    return entry
+
+
 def invalidate_subscriber(user_id: uuid.UUID) -> None:
     """Reload one subscriber's row from the DB and reposition it under the
     correct trader_id bucket. Call this from any endpoint that mutates

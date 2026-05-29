@@ -27,12 +27,9 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    pending_copy_status = sa.Enum(
-        "queued", "processing", "submitted", "failed",
-        name="pending_copy_status",
-    )
-    pending_copy_status.create(op.get_bind(), checkfirst=True)
-
+    # Let create_table own the enum type creation exactly once. (An explicit
+    # .create() PLUS a column enum led to a double CREATE TYPE — the generic
+    # sa.Enum(create_type=False) does not reliably suppress it under alembic.)
     op.create_table(
         "pending_copies",
         sa.Column(
@@ -56,7 +53,7 @@ def upgrade() -> None:
             "status",
             sa.Enum(
                 "queued", "processing", "submitted", "failed",
-                name="pending_copy_status", create_type=False,
+                name="pending_copy_status",
             ),
             nullable=False,
             server_default="queued",

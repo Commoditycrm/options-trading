@@ -113,8 +113,10 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "parent_order_missing")
             return "parent_missing"
 
-        # Read settings from the in-memory cache — no DB round-trip.
-        entry = memory_cache.get_subscriber(pc.subscriber_user_id)
+        # Read settings from the in-memory cache — no DB round-trip on a hit.
+        # On a miss, fall back to a DB load (self-healing cold/stale cache)
+        # instead of wrongly failing the copy as disabled.
+        entry = memory_cache.get_subscriber_or_load(pc.subscriber_user_id)
         if entry is None or not entry.copy_enabled:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "copy_disabled")
             return "copy_disabled"
