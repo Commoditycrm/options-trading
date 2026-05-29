@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -254,9 +255,17 @@ def heartbeat_status() -> dict[str, Any]:
     }
 
 
+# Dedicated thread pool for the workers' blocking DB + broker calls. We must
+# NOT use the default executor (run_in_executor(None, …)) — its size is
+# min(32, cpu+4), which would throttle a 100-coroutine worker pool to ~12-32
+# concurrent broker calls and silently serialise the fanout. Sized to the
+# worker count in start_workers() so all N broker calls truly run at once.
+_executor: ThreadPoolExecutor | None = None
+
+
 async def _worker_loop(worker_id: int) -> None:
-    """One coroutine. Claims rows one at a time; broker call goes through
-    run_in_executor so we don't block the loop for the others."""
+    """One coroutine. Claims rows one at a time; the blocking claim + broker
+    call run in the dedicated executor so all N workers progress in parallel."""
     loop = asyncio.get_running_loop()
     log.info("subscriber_worker[%d]: starting", worker_id)
     while True:
@@ -264,11 +273,11 @@ async def _worker_loop(worker_id: int) -> None:
         try:
             # Claim happens inside a thread executor too — SQLAlchemy is
             # sync and the lock query needs its own connection.
-            claimed_id = await loop.run_in_executor(None, _claim_one_id)
+            claimed_id = await loop.run_in_executor(_executor, _claim_one_id)
             if claimed_id is None:
                 await asyncio.sleep(POLL_IDLE_SLEEP_MS / 1000)
                 continue
-            outcome = await loop.run_in_executor(None, _process_one_sync, claimed_id)
+            outcome = await loop.run_in_executor(_executor, _process_one_sync, claimed_id)
             log.debug("subscriber_worker[%d]: pc=%s outcome=%s",
                       worker_id, claimed_id, outcome)
         except asyncio.CancelledError:
@@ -289,17 +298,26 @@ _workers: list[asyncio.Task] = []
 
 
 async def start_workers(count: int = DEFAULT_WORKER_COUNT) -> None:
-    """Launch ``count`` concurrent worker coroutines on the running loop."""
+    """Launch ``count`` concurrent worker coroutines on the running loop,
+    backed by a thread pool sized to ``count`` so all N blocking broker
+    calls run in parallel (not throttled by the default executor)."""
+    global _executor
     if _workers:
         log.warning("subscriber_worker: already started (%d), skipping",
                     len(_workers))
         return
+    _executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="subworker")
     for i in range(count):
         _workers.append(asyncio.create_task(_worker_loop(i)))
-    log.info("subscriber_worker: started %d worker(s)", count)
+    log.info("subscriber_worker: started %d worker(s) (executor max_workers=%d)",
+             count, count)
 
 
 async def stop_workers() -> None:
+    global _executor
     for t in _workers:
         t.cancel()
     _workers.clear()
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+        _executor = None

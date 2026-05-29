@@ -15,6 +15,11 @@ services:
   postgres:
     image: postgres:16
     restart: unless-stopped
+    # Raise max_connections so a full QUEUE_DEMO_WORKER_COUNT=100 worker pool
+    # (each worker holds a DB connection while claiming + submitting) plus the
+    # backend's own pool fit comfortably under the limit. Default is 100,
+    # which 100 workers would exhaust. See doc/ARCHITECTURE.md §8.
+    command: ["postgres", "-c", "max_connections=250"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-signalboxx}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in deploy/.env.demo}
