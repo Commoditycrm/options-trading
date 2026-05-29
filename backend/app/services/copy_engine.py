@@ -54,6 +54,29 @@ log = logging.getLogger(__name__)
 
 MAX_PARALLEL = 32
 
+# Grace window for listener-detected orders: an order whose broker-side
+# placement time is older than (broker_account.created_at - this) is treated
+# as pre-connection history and NOT mirrored. See order_predates_connection.
+FANOUT_HISTORICAL_GRACE_S = 120
+
+
+def order_predates_connection(
+    broker_account: "BrokerAccount | None",
+    order_placed_at: "datetime | None",
+) -> bool:
+    """True if a listener-detected order was placed before we began watching
+    the trader's broker (so it's history and must NOT be mirrored). Compares
+    the order's broker-side placement time against broker_account.created_at
+    minus a grace window. Fail-open (False → allow) when a timestamp is
+    missing — dropping a real just-placed trade is worse than occasionally
+    mirroring one borderline historical order."""
+    if order_placed_at is None or broker_account is None or broker_account.created_at is None:
+        return False
+    placed = order_placed_at if order_placed_at.tzinfo else order_placed_at.replace(tzinfo=timezone.utc)
+    created = broker_account.created_at
+    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    return placed < created - timedelta(seconds=FANOUT_HISTORICAL_GRACE_S)
+
 
 @dataclass
 class FanoutResult:

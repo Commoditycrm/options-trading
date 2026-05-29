@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -295,6 +295,37 @@ def _register_or_reset_snaptrade_user(user_id: uuid.UUID) -> str:
 
 
 # ── SnapTrade two-step connect ───────────────────────────────────────────────
+
+@router.post("/snaptrade/webhook")
+async def snaptrade_webhook(request: Request, background: BackgroundTasks) -> dict:
+    """Inbound SnapTrade webhook — UNAUTHENTICATED (SnapTrade calls this).
+    On any event carrying a userId we recognise, schedule an immediate poll
+    of that trader's orders so detection is near-instant instead of waiting
+    for the next poll tick. Safe-by-design: a forged call can at most trigger
+    a re-poll, which fetches REAL orders from SnapTrade and dedups — it can't
+    inject fake trades. Signature verification is a TODO (log headers first).
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    event_type = body.get("eventType") or body.get("type") or "unknown"
+    user_id_raw = body.get("userId") or body.get("user_id")
+    if not user_id_raw:
+        log.info("snaptrade webhook: test/no-user event=%s", event_type)
+        return {"ok": True}
+    try:
+        trader_user_id = uuid.UUID(str(user_id_raw))
+    except (ValueError, TypeError):
+        log.warning("snaptrade webhook: unparseable userId=%r", user_id_raw)
+        return {"ok": True}
+    try:
+        from app.services import snaptrade_listener
+        background.add_task(snaptrade_listener.poll_now_for_trader, trader_user_id)
+    except ImportError:
+        log.info("snaptrade webhook: snaptrade SDK not installed; ignoring")
+    return {"ok": True}
+
 
 @router.post("/snaptrade/start", response_model=StartSnaptradeOut)
 def snaptrade_start(

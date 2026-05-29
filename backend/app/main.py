@@ -11,7 +11,7 @@ from app.api import (
 )
 from app.config import get_settings
 from app.services import (
-    alpaca_stream, external_trade_poller, fanout_stream, memory_cache,
+    alpaca_stream, external_trade_poller, fanout_stream, listeners, memory_cache,
     retry_scheduler, subscriber_worker,
 )
 from app.services import events as events_bus
@@ -75,7 +75,28 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
-        events_bus.bind_loop(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        events_bus.bind_loop(loop)
+        # Bind the loop for the Webull/SnapTrade polling listeners too.
+        listeners.bind_loop(loop)
+
+    @app.on_event("startup")
+    async def _start_broker_listeners() -> None:
+        # Spawn Webull + SnapTrade detection listeners for every connected
+        # trader account. (Alpaca is handled by _start_alpaca_streams below.)
+        # Detected orders flow into copy_engine.dispatch_detected_order →
+        # the queue fast path. Best-effort: missing SDKs are skipped.
+        try:
+            await listeners.start_all_listeners()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("uvicorn").exception("failed to start broker listeners")
+
+    @app.on_event("shutdown")
+    async def _stop_broker_listeners() -> None:
+        try:
+            await listeners.stop_all_listeners()
+        except Exception:  # noqa: BLE001
+            pass
 
     @app.on_event("startup")
     async def _start_alpaca_streams() -> None:
