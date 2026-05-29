@@ -1,4 +1,4 @@
-export type Role = "trader" | "subscriber";
+export type Role = "trader" | "subscriber" | "admin";
 
 export interface User {
   id: string;
@@ -8,7 +8,7 @@ export interface User {
   is_active: boolean;
 }
 
-export type BrokerName = "alpaca" | "ibkr";
+export type BrokerName = "alpaca" | "ibkr" | "webull" | "snaptrade" | "mock";
 
 export interface BrokerAccount {
   id: string;

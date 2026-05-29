@@ -6,7 +6,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
-    auth, brokers, events, notifications, options, positions, settings, subscribers, trades,
+    admin, auth, brokers, events, notifications, options, positions, settings, subscribers,
+    trades,
 )
 from app.config import get_settings
 from app.services import (
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
     app.include_router(options.router)
     app.include_router(positions.router)
     app.include_router(notifications.router)
+    app.include_router(admin.router)
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
