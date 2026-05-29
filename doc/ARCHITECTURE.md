@@ -165,6 +165,42 @@ because:
 
 ---
 
+## 5b. Measured results (local Docker, honest numbers)
+
+Run on Docker Desktop (WSL2), **1 trader, 100 subscribers, mock broker**
+(200–400 ms simulated latency + ~3% random failures), worker pool of 100,
+Postgres `max_connections=250`, SQLAlchemy pool sized to the worker count.
+
+| Metric | Measured | Note |
+|---|---|---|
+| **Hot path** (queue all 100 & return) | **~15–20 ms** | The headline win — trader is freed here |
+| Outcome | **96–98 submitted / 2–4 failed** | failures = the mock broker's ~3% rejections → **per-subscriber fault isolation works** |
+| Full drain (all 100 placed) | **~2.1–2.5 s** | NOT the "≈ one broker call" we projected — see below |
+
+**The real win is confirmed:** the trader's hot path returns in **~15 ms**
+regardless of subscriber count, vs the serial path that **blocks the trader
+for ~2,300 ms**. That ~150× decoupling is the architecture's point and it
+holds.
+
+**What the run disproved:** total *completion* time did NOT collapse to one
+broker call. Removing two hard ceilings (SQLAlchemy pool 15→140; default
+thread-executor ~32→100) did **not** drop the drain below ~2 s, because the
+next ceiling is fundamental to this implementation:
+
+- **Python GIL + heavy ORM per row.** Each worker does several SQLAlchemy
+  ORM queries + commits per copy. The broker `sleep()` releases the GIL (so
+  those overlap), but the ORM/Python work between them serialises on the GIL
+  — 100 threads can't run their Python portions at once.
+- **100-way claim contention.** One-row-at-a-time `SELECT … FOR UPDATE SKIP
+  LOCKED` + commit, ×100 concurrent, contends on the table/WAL.
+
+So at 100 threads the design **decouples the trader brilliantly but does not
+linearly parallelise completion**. Getting true ≈one-wave completion needs
+process-based workers (escape the GIL), batched claims, and/or core-SQL
+(not ORM) in the hot loop — see §8.
+
+---
+
 ## 6. Components (App 2)
 
 | Component | File | Responsibility |
@@ -210,7 +246,8 @@ because:
 | Trigger | What hurts | Fix |
 |---|---|---|
 | ~100–200 subs, 1 trader | Nothing — sweet spot | — (current target) |
-| Run full 100 workers | Postgres `max_connections` (100) | Raise to ~250 or pool connections |
+| Run full 100 workers | SQLAlchemy app pool (15) **and** Postgres `max_connections` (100) | ✅ done: pool sized to worker count + Postgres `max_connections=250` |
+| Want **completion** ≈ one broker call | **GIL + per-row ORM + claim contention** caps thread parallelism (~2 s drain at 100, measured §5b) | Process-based workers (escape GIL); batch-claim N rows per worker; core-SQL not ORM in the hot loop |
 | ~500+ subscribers | 1-wave parallelism breaks; polling overhead | Dedicated worker service; polling → **Postgres LISTEN/NOTIFY** (or Redis) |
 | Multiple backend instances (HA) | In-memory caches drift | **Shared cache** (Redis) or invalidation pub/sub |
 | Multiple active traders at once | Queue contention | Partition workers; per-broker throttling |
