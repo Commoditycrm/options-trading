@@ -15,3 +15,12 @@ alpaca-py==0.33.0
 ibind==0.1.23
 redis==5.2.0
 python-dateutil==2.9.0
+# Unofficial Webull SDK (reverse-engineered against the mobile app). Pinned
+# because tedchou12/webull breaks roughly quarterly when Webull changes its
+# internal endpoints. Imported lazily in app/brokers/__init__.py so a missing
+# or broken install doesn't take down the whole app.
+webull==0.6.1
+# SnapTrade aggregator — official SDK (imports as `snaptrade_client`). Needs
+# SNAPTRADE_CLIENT_ID + SNAPTRADE_CONSUMER_KEY env vars; without them the
+# connect endpoints return 503 so dev environments aren't broken.
+snaptrade-python-sdk==11.0.197

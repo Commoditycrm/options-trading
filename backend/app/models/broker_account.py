@@ -16,6 +16,12 @@ class BrokerName(str, enum.Enum):
     Postgres broker_name enum (see e7c4a9b21d83_add_ibkr_to_broker_name_enum)."""
     ALPACA = "alpaca"
     IBKR = "ibkr"
+    # Direct Webull (unofficial SDK) and the SnapTrade aggregator. Added via
+    # migration b7e4c2a9f013. WEBULL = trader-direct or subscriber placement;
+    # SNAPTRADE = aggregator (Webull-via-SnapTrade supports trading since
+    # Dec 2025). Adapters: app/brokers/webull.py, app/brokers/snaptrade.py.
+    WEBULL = "webull"
+    SNAPTRADE = "snaptrade"
     # Demo-only simulated broker (app/brokers/mock.py). Added via migration
     # e1f2a3b4c5d6. Used by scripts/seed_demo.py so the queue demo runs
     # without real broker credentials.
