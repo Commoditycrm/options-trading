@@ -41,11 +41,13 @@ from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.pending_copy import PendingCopy, PendingCopyStatus
+from app.models.settings import SubscriberSettings
 from app.services import audit, events, memory_cache
 from app.services.copy_engine import _order_event
 from app.services.crypto import decrypt_json
 from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
-from app.services.pnl import today_realized_pnl
+from app.services.pnl import get_account_equity, last_trade_pnl, today_realized_pnl
+from decimal import Decimal as _D
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +102,24 @@ def _record_outcome(
     db.commit()
 
 
+def _auto_pause(db: Session, pc: PendingCopy, user_id: uuid.UUID,
+                reason: str, metadata: dict[str, str]) -> None:
+    """A risk limit tripped: flip the subscriber's copy_enabled off, sync the
+    in-memory cache so subsequent orders skip them instantly, audit + SSE,
+    and mark this pending_copy FAILED with the reason."""
+    sub = db.get(SubscriberSettings, user_id)
+    if sub is not None:
+        sub.copy_enabled = False
+    audit.record(
+        db, actor_user_id=user_id, action=f"copy.auto_paused_{reason}",
+        entity_type="subscriber_settings", entity_id=user_id, metadata=metadata,
+    )
+    db.commit()
+    memory_cache.invalidate_subscriber(user_id)
+    events.publish(user_id, {"type": "copy.auto_paused", "reason": reason, **metadata})
+    _record_outcome(db, pc, PendingCopyStatus.FAILED, reason)
+
+
 def _process_one_sync(pc_id: uuid.UUID) -> str:
     """Synchronous body of one worker iteration — runs in a thread
     executor so the broker SDK's blocking HTTP calls don't block the
@@ -125,13 +145,60 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "not_following")
             return "not_following"
 
-        # Daily-loss kill switch — still a DB hit (today's realized P&L
-        # needs fill data) but only for subscribers who set a limit.
+        # ── Risk gates — all run BEFORE placing; any trip auto-pauses copy. ──
+        # 1a. Legacy absolute daily-loss kill switch.
         if entry.daily_loss_limit is not None:
             todays_pnl = today_realized_pnl(db, entry.user_id)
             if todays_pnl <= -entry.daily_loss_limit:
-                _record_outcome(db, pc, PendingCopyStatus.FAILED, "daily_loss_limit")
+                _auto_pause(db, pc, entry.user_id, "daily_loss_limit", {
+                    "daily_loss_limit": str(entry.daily_loss_limit),
+                    "todays_realized_pnl": str(todays_pnl),
+                })
                 return "daily_loss_limit"
+
+        # 1b. Daily loss limit as % of account equity.
+        if entry.daily_loss_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_limit = equity * entry.daily_loss_limit_pct / _D(100)
+                todays_pnl = today_realized_pnl(db, entry.user_id)
+                if todays_pnl <= -dollar_limit:
+                    _auto_pause(db, pc, entry.user_id, "daily_loss_limit_pct", {
+                        "daily_loss_limit_pct": str(entry.daily_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(_D("0.01"))),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "account_equity": str(equity),
+                    })
+                    return "daily_loss_limit_pct"
+
+        # 1c. Per-trade loss limit as % of equity (last closed round-trip).
+        if entry.per_trade_loss_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_limit = equity * entry.per_trade_loss_limit_pct / _D(100)
+                last_pnl = last_trade_pnl(db, entry.user_id)
+                if last_pnl is not None and last_pnl <= -dollar_limit:
+                    _auto_pause(db, pc, entry.user_id, "per_trade_loss_limit", {
+                        "per_trade_loss_limit_pct": str(entry.per_trade_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(_D("0.01"))),
+                        "last_trade_pnl": str(last_pnl),
+                        "account_equity": str(equity),
+                    })
+                    return "per_trade_loss_limit"
+
+        # 1d. Max-drawdown protection vs the baseline captured when enabled.
+        if entry.max_drawdown_pct is not None and entry.max_drawdown_equity_baseline is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity is not None:
+                min_equity = entry.max_drawdown_equity_baseline * (1 - entry.max_drawdown_pct / _D(100))
+                if equity <= min_equity:
+                    _auto_pause(db, pc, entry.user_id, "max_drawdown", {
+                        "max_drawdown_pct": str(entry.max_drawdown_pct),
+                        "equity_baseline": str(entry.max_drawdown_equity_baseline),
+                        "current_equity": str(equity),
+                        "min_equity_threshold": str(min_equity.quantize(_D("0.01"))),
+                    })
+                    return "max_drawdown"
 
         if not entry.broker_accounts:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "no_broker")

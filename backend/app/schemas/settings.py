@@ -12,6 +12,11 @@ class SubscriberSettingsOut(BaseModel):
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    # Percentage-based risk controls (NULL = disabled).
+    daily_loss_limit_pct: Decimal | None = None
+    per_trade_loss_limit_pct: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
+    max_drawdown_equity_baseline: Decimal | None = None
     # Retry policy. NEVER (default) = no retry on broker-disconnect failures.
     retry_interval_open: RetryInterval = RetryInterval.NEVER
     retry_interval_close: RetryInterval = RetryInterval.NEVER
@@ -53,6 +58,21 @@ class DailyLossLimitIn(BaseModel):
     """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
 
     daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class DailyLossLimitPctIn(BaseModel):
+    """Daily realized-loss limit as a % of account equity. Null to disable."""
+    daily_loss_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class PerTradeLossLimitPctIn(BaseModel):
+    """Per-trade realized-loss limit as a % of account equity. Null to disable."""
+    per_trade_loss_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class MaxDrawdownPctIn(BaseModel):
+    """Max drawdown % below the equity baseline captured when enabled. Null to disable."""
+    max_drawdown_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
 
 
 class FollowTraderIn(BaseModel):

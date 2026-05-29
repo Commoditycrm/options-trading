@@ -79,6 +79,20 @@ class SubscriberSettings(Base, TimestampMixin):
     # auto-flipped to false and an audit + SSE event are emitted.
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
 
+    # ── Percentage-based risk controls ─────────────────────────────────────
+    # All stored as a positive percentage, e.g. 5.000 = 5%. NULL = disabled.
+    # Enforced per-subscriber in the worker pool (subscriber_worker) before
+    # placing each mirror order; tripping any of them auto-pauses copying.
+    # Stop copying if today's realized loss exceeds X% of account equity.
+    daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    # Stop copying if any single closed trade's realized loss exceeds X% of equity.
+    per_trade_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    # Stop copying if account equity drops X% below the baseline captured when
+    # protection was enabled (max_drawdown_equity_baseline).
+    max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    # Account-equity snapshot taken when max_drawdown_pct is first set.
+    max_drawdown_equity_baseline: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)
+
     # Retry policy for mirror orders that fail with a transient/broker-disconnect
     # error (network blip, 5xx, rate limit, timeout). On such a failure we
     # schedule a single retry at this interval; if THAT also fails we mark

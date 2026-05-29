@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.models.broker_account import BrokerAccount
 from app.models.order import Fill, InstrumentType, Order, OrderSide
 
 try:
@@ -178,3 +179,97 @@ def realized_pnl_by_day(
                 open_lots[key].append(_Lot(qty=-qty, price=price))
 
     return dict(daily)
+
+
+def get_account_equity(db: Session, user_id: uuid.UUID) -> Decimal | None:
+    """Sum of total_equity across the user's connected broker accounts, from
+    the cached balance snapshot in broker_accounts (no live broker call).
+    Returns None if no connected account has an equity figure yet. Fast
+    (single query) so it's safe to call from the per-subscriber risk gates."""
+    rows = db.execute(
+        select(BrokerAccount).where(
+            BrokerAccount.user_id == user_id,
+            BrokerAccount.connection_status == "connected",
+            BrokerAccount.total_equity.isnot(None),
+        )
+    ).scalars().all()
+    if not rows:
+        return None
+    return sum((r.total_equity for r in rows), Decimal(0))
+
+
+def last_trade_pnl(db: Session, user_id: uuid.UUID, tz_name: str | None = None) -> Decimal | None:
+    """Realized P&L of the subscriber's most recently closed round-trip trade.
+    Same FIFO lot-matching as realized_pnl_by_day, but returns only the single
+    most recent closing P&L (or None if no closed trades). Used by the
+    per-trade loss-limit check."""
+    orders: list[Order] = list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+    ).scalars())
+    if not orders:
+        return None
+
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    if order_ids:
+        for f in db.execute(select(Fill).where(Fill.order_id.in_(order_ids))).scalars():
+            fills_by_order[f.order_id].append(f)
+
+    timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []
+    for o in orders:
+        fs = fills_by_order.get(o.id)
+        if fs:
+            for f in fs:
+                timeline.append((f.filled_at, f.quantity, f.price, o))
+        else:
+            when = o.closed_at or o.submitted_at or o.created_at
+            timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
+    timeline.sort(key=lambda e: e[0])
+
+    open_lots: dict[tuple, deque] = defaultdict(deque)
+    last_pnl: Decimal | None = None
+
+    for filled_at, fill_qty, fill_price, order in timeline:
+        key = _instrument_key(order)
+        unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+        qty = fill_qty
+        price = fill_price
+
+        if order.side == OrderSide.BUY:
+            if open_lots[key] and open_lots[key][0].qty < 0:
+                pnl = Decimal(0)
+                while qty > 0 and open_lots[key] and open_lots[key][0].qty < 0:
+                    lot = open_lots[key][0]
+                    take = min(qty, -lot.qty)
+                    pnl += (lot.price - price) * take * unit
+                    lot.qty += take
+                    qty -= take
+                    if lot.qty == 0:
+                        open_lots[key].popleft()
+                last_pnl = pnl
+                if qty > 0:
+                    open_lots[key].append(_Lot(qty=qty, price=price))
+            else:
+                open_lots[key].append(_Lot(qty=qty, price=price))
+        else:  # SELL
+            if open_lots[key] and open_lots[key][0].qty > 0:
+                pnl = Decimal(0)
+                while qty > 0 and open_lots[key] and open_lots[key][0].qty > 0:
+                    lot = open_lots[key][0]
+                    take = min(qty, lot.qty)
+                    pnl += (price - lot.price) * take * unit
+                    lot.qty -= take
+                    qty -= take
+                    if lot.qty == 0:
+                        open_lots[key].popleft()
+                last_pnl = pnl
+                if qty > 0:
+                    open_lots[key].append(_Lot(qty=-qty, price=price))
+            else:
+                open_lots[key].append(_Lot(qty=-qty, price=price))
+
+    return last_pnl
