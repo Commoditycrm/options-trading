@@ -306,28 +306,16 @@ def _maybe_handle_external_order(
         },
     )
 
-    # Dispatch fanout. Prefer Redis Streams when configured (parallel
-    # processing across worker pods); fall back to in-process if not.
-    targets = enumerate_fanout_targets(db, owner.id)
-    if fanout_stream.is_configured():
-        count = fanout_stream.publish_targets(order.id, targets)
-        audit.record(
-            db, actor_user_id=owner.id, action="trader.fanout_dispatched",
-            entity_type="order", entity_id=order.id,
-            metadata={
-                "dispatch": "redis_stream",
-                "source": "external",
-                "target_count": count,
-            },
-        )
-    else:
-        # Defer in-process fanout to AFTER we commit so the trader Order
-        # is visible to worker sessions. We don't have a great mechanism
-        # for that here (this is a sync function inside the stream
-        # handler), so we just commit + call fanout synchronously.
-        db.commit()
-        from app.services.copy_engine import fanout as _fanout_in_process
-        _fanout_in_process(db, order, owner)
+    # Dispatch via the unified entrypoint — queue-based fast path by default
+    # (returns in ~8ms; the async worker pool places the mirror orders),
+    # with Redis-Streams / in-process serial as legacy fallbacks.
+    from app.services.copy_engine import dispatch_detected_order
+    result = dispatch_detected_order(db, order, owner)
+    audit.record(
+        db, actor_user_id=owner.id, action="trader.fanout_dispatched",
+        entity_type="order", entity_id=order.id,
+        metadata={"source": "external", **result},
+    )
     db.commit()
 
     return order

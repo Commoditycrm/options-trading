@@ -130,4 +130,6 @@ def set_multiplier(
         ip_address=client_ip(request),
     )
     db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(subscriber_id)
     return {"ok": True}

@@ -588,6 +588,37 @@ def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
     return len(rows)
 
 
+def dispatch_detected_order(db: Session, trader_order: Order, trader: User) -> dict[str, Any]:
+    """Single dispatch entrypoint for a freshly-detected trader order.
+
+    App 2 default = the queue-based fast path (``queue_fanout``): the
+    detection handler returns in ~8ms and the async worker pool places the
+    mirror orders. Falls back to Redis Streams or the in-process serial
+    ``fanout`` when ``use_queue_fanout`` is disabled (legacy / comparison).
+
+    Returns a small metadata dict the caller folds into its audit record.
+    """
+    from app.config import get_settings
+
+    if getattr(get_settings(), "use_queue_fanout", True):
+        # Commit so the trader Order row is visible to worker sessions before
+        # we enqueue pending_copies rows that FK-reference it.
+        db.commit()
+        queued = queue_fanout(db, trader_order, trader)
+        return {"dispatch": "queue", "queued": queued}
+
+    # ── Legacy dispatch paths (only when use_queue_fanout=False) ──────────
+    from app.services import fanout_stream
+    targets = enumerate_fanout_targets(db, trader.id)
+    if fanout_stream.is_configured():
+        count = fanout_stream.publish_targets(trader_order.id, targets)
+        db.commit()
+        return {"dispatch": "redis_stream", "target_count": count}
+    db.commit()
+    fanout(db, trader_order, trader)
+    return {"dispatch": "in_process", "target_count": len(targets)}
+
+
 def _order_event(event_type: str, order: Order) -> dict[str, Any]:
     """Compact payload — frontend can use it directly to prepend a row."""
     return {

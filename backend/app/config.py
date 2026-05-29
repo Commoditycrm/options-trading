@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # of the backend pod's memory budget.
     run_fanout_worker_in_process: bool = True
 
+    # App 2's signature path: route detected trader orders through the
+    # queue-based fast fanout (queue_fanout + pending_copies + async worker
+    # pool) instead of the legacy serial fanout / Redis Streams. Default True.
+    # Set False to fall back to the legacy dispatch (for A/B comparison).
+    use_queue_fanout: bool = True
+
     # Number of worker threads to spawn. Each one runs its own consume_loop
     # against the same Redis Stream Consumer Group, so messages are shared
     # across them — true parallel processing of subscriber broker calls.

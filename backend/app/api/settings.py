@@ -151,6 +151,10 @@ def toggle_copy(
         ip_address=client_ip(request),
     )
     db.commit()
+    # Keep the queue fanout's in-memory subscriber cache in sync so the next
+    # detected order sees this copy_enabled change immediately.
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
     db.refresh(s)
     return s
 
@@ -177,6 +181,8 @@ def set_own_multiplier(
         ip_address=client_ip(request),
     )
     db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
     db.refresh(s)
     return s
 
@@ -206,6 +212,8 @@ def follow_trader(
         ip_address=client_ip(request),
     )
     db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
     db.refresh(s)
     return s
 
