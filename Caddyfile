@@ -1,0 +1,21 @@
+# Caddy reverse proxy with automatic Let's Encrypt TLS.
+# {$DOMAIN} is read from the environment (set in .env, passed by compose).
+{$DOMAIN} {
+	encode gzip zstd
+
+	# API + SSE go straight to the backend. Routing /api/* here (rather than
+	# through the Next.js rewrite) keeps long-lived EventSource streams from
+	# being cut off by an intermediate proxy timeout.
+	@api path /api/*
+	handle @api {
+		reverse_proxy backend:8000 {
+			# Don't buffer — SSE must flush events as they arrive.
+			flush_interval -1
+		}
+	}
+
+	# Everything else is the Next.js frontend.
+	handle {
+		reverse_proxy frontend:3000
+	}
+}
