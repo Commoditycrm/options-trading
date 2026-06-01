@@ -2,7 +2,7 @@
 
 Why this exists
 ---------------
-Jayesh's signalboxx codebase had explicit recovery logic for common broker
+An earlier copy-trading codebase had explicit recovery logic for common broker
 rejections (market-order-after-hours, 0DTE-expired, rate-limit-throttle). In
 this app, before this module, a rejection bubbled straight back to the user
 as an audit entry + red status pill. Most rejections fall into a small set

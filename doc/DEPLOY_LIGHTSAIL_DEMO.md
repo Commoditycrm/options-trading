@@ -134,7 +134,7 @@ docker compose -f docker-compose.demo.yml exec backend python -m scripts.seed_de
 ```
 
 After `--fire-order`, open `/admin/demo` and watch the workers drain the
-queue in real time. You can also log in as `demo-trader@signalboxx.test`
+queue in real time. You can also log in as `demo-trader@optionhaven.test`
 (password `demo1234`) and place orders from the Trade Panel to generate
 fresh batches on demand.
 
@@ -167,7 +167,7 @@ git pull && docker compose -f docker-compose.demo.yml --env-file deploy/.env.dem
 docker compose -f docker-compose.demo.yml logs -f
 
 # psql into the demo DB
-docker compose -f docker-compose.demo.yml exec postgres psql -U signalboxx signalboxx_demo
+docker compose -f docker-compose.demo.yml exec postgres psql -U optionhaven optionhaven_demo
 
 # Tear everything down (keeps the DB volume)
 docker compose -f docker-compose.demo.yml down

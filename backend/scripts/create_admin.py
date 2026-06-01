@@ -41,7 +41,7 @@ from app.models.user import User, UserRole  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s :: %(message)s")
 log = logging.getLogger("create_admin")
 
-_TEMP_PASSWORD = "SignalBoxx-Admin-ChangeMe!"
+_TEMP_PASSWORD = "OptionHaven-Admin-ChangeMe!"
 
 
 def main() -> int:

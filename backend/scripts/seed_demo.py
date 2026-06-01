@@ -1,8 +1,8 @@
 """Seed data for the queue-fanout demo.
 
 Creates (idempotently):
-  - 1 trader  (demo-trader@signalboxx.test / demo1234) with trading enabled
-  - N subscribers (demo-sub-XX@signalboxx.test / demo1234) each:
+  - 1 trader  (demo-trader@optionhaven.test / demo1234) with trading enabled
+  - N subscribers (demo-sub-XX@optionhaven.test / demo1234) each:
       * following the trader, copy_enabled=True, multiplier=1.0
       * one MOCK broker account (simulated 200-400ms latency, no real keys)
 
@@ -13,7 +13,7 @@ Usage (inside the backend container or any env with DATABASE_URL set):
 
     python -m scripts.seed_demo --subscribers 100
     python -m scripts.seed_demo --subscribers 100 --fire-order
-    python -m scripts.seed_demo --reset        # delete all demo-*@signalboxx.test users
+    python -m scripts.seed_demo --reset        # delete all demo-*@optionhaven.test users
 
 The mock broker accepts every order (with ~3% simulated failures), so this
 needs NO real broker credentials — it exists purely to exercise the queue
@@ -38,7 +38,7 @@ from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services.crypto import encrypt_json
 
-DEMO_DOMAIN = "signalboxx.test"
+DEMO_DOMAIN = "optionhaven.test"
 TRADER_EMAIL = f"demo-trader@{DEMO_DOMAIN}"
 PASSWORD = "demo1234"
 
@@ -184,7 +184,7 @@ def main() -> None:
     p.add_argument("--fire-order", action="store_true",
                    help="also create + fan out one trader order")
     p.add_argument("--reset", action="store_true",
-                   help="delete all demo-*@signalboxx.test users and exit")
+                   help="delete all demo-*@optionhaven.test users and exit")
     args = p.parse_args()
 
     if args.reset:

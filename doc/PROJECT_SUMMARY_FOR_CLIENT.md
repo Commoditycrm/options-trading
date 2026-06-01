@@ -1,4 +1,4 @@
-# SignalBoxx — Project Summary
+# Option Haven — Project Summary
 
 A handoff brief covering **what was built**, the **technology choices** behind each piece, and the **alternatives that were considered and rejected** (with reasons). Intended for the client's decision-makers — written in plain English with technical specifics where they matter.
 

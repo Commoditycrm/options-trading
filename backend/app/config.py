@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # fanout entirely; in that case copy_engine.fanout runs the existing
     # in-process ThreadPoolExecutor path (fine for single-pod dev).
     redis_url: str = ""
-    fanout_stream: str = "signalboxx:fanout"     # XADD stream name
+    fanout_stream: str = "optionhaven:fanout"     # XADD stream name
     fanout_group: str = "fanout_workers"          # consumer group
 
     # When True, the FastAPI process also starts fanout workers as

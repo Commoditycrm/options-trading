@@ -144,7 +144,7 @@ docker compose -f docker-compose.demo.yml exec backend \
 ```
 
 ### Step 6 — Open in browser
-- `http://<ip>/login` → log in as `demo-trader@signalboxx.test` / `demo1234`
+- `http://<ip>/login` → log in as `demo-trader@optionhaven.test` / `demo1234`
 - `http://<ip>/admin` → log in as your admin email (from step 5)
 - `http://<ip>/admin/demo` → queue dashboard (live timings)
 
@@ -224,5 +224,5 @@ doc/
 - **Never touch `main` or Gaurav's branches** in `copy-trading-app`
 - **`options-trading` is App 2** — all our work goes here
 - **`anitha-trade-features` branches off `anitha-brokers`** — preserve that lineage
-- The demo DB (`signalboxx_demo`) is isolated from App 1 — its own Postgres container + volume on App 2's own Lightsail instance
+- The demo DB (`optionhaven_demo`) is isolated from App 1 — its own Postgres container + volume on App 2's own Lightsail instance
 - `deploy/.env.demo` is gitignored — never commit secrets
