@@ -61,10 +61,14 @@ services:
       - key: CREDENTIAL_ENCRYPTION_KEY
         sync: false                # MUST be set manually via dashboard
                                    # (see "First-time setup" above)
+      # NOTE: App 2 (Option Haven) deploys to Lightsail via
+      # docker-compose.demo.yml, which sets these from PUBLIC_URL. This
+      # render.yaml is unused for that path — set to App 2's own public URL
+      # only if you ever deploy this app on Render. Do NOT point at App 1.
       - key: CORS_ORIGINS
-        value: https://copy-trading-app.vercel.app
+        value: https://YOUR_OPTIONS_TRADING_PUBLIC_URL
       - key: FRONTEND_BASE_URL
-        value: https://copy-trading-app.vercel.app
+        value: https://YOUR_OPTIONS_TRADING_PUBLIC_URL
       - key: PYTHON_VERSION
         value: "3.11.9"
       # Redis Streams for parallel copy-trade fan-out. See doc/DEPLOY.md

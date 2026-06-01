@@ -25,7 +25,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Set `CREDENTIAL_ENCRYPTION_KEY` to that value. **Never rotate this in place** — every encrypted broker credential in the DB will become unreadable.
 
-3. **Update `CORS_ORIGINS` and `FRONTEND_BASE_URL`** in `render.yaml` to match your actual Vercel URL (default assumes `copy-trading-app.vercel.app`).
+3. **Update `CORS_ORIGINS` and `FRONTEND_BASE_URL`** in `render.yaml` to match this app's own public URL. (The Lightsail deploy — see `DEPLOY_LIGHTSAIL_DEMO.md` — sets these from `PUBLIC_URL` and ignores `render.yaml`.)
 
 4. **Free tier limitation:** the service spins down after 15 minutes of inactivity. When it spins down, the Alpaca trade-update WebSocket dies and any open SSE connection drops. The next request wakes it (30+ second cold start) and the stream reconnects. **Bump to the Starter plan ($7/mo) before going live** — the always-on guarantee is what makes the streaming features work in production.
 

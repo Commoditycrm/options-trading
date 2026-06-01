@@ -1,8 +1,8 @@
 # Queue-Demo Deployment — AWS Lightsail (single box, Docker Compose)
 
-Deploys the `anitha-queue-demo` branch as a **separate** app so you can show the
-queue-based fanout side by side with the current serial-fanout app. Nothing here
-touches the production deployment.
+Deploys the `anitha-trade-features` branch (App 2 — Option Haven) to its **own
+Lightsail instance**, separate from App 1 (`copy-trading-app`, the serial-fanout
+app on its own instance). Nothing here touches App 1.
 
 ```
             ┌────────────────────── Lightsail instance ──────────────────────┐
@@ -38,9 +38,9 @@ docker --version && docker compose version
 ## 3. Clone the demo branch
 
 ```bash
-git clone https://github.com/Commoditycrm/copy-trading-app.git
-cd copy-trading-app
-git checkout anitha-queue-demo
+git clone https://github.com/Commoditycrm/options-trading.git
+cd options-trading
+git checkout anitha-trade-features
 ```
 
 ## 4. Configure secrets
@@ -101,19 +101,17 @@ networks block mixed content. If you have a domain:
 
 Each of the 100 workers opens a DB connection while it holds a claimed row +
 submits the child order. Postgres defaults to `max_connections=100`, which the
-backend's own pool + 100 workers will exceed. Two safe options:
+backend's own pool + 100 workers would exceed — so `docker-compose.demo.yml`
+**already** raises it to `max_connections=250` (see the `postgres` service
+`command:`). No manual edit needed. Pick a worker count in `.env.demo`:
 
-- **Easy:** keep `QUEUE_DEMO_WORKER_COUNT=50` (default in `.env.demo.example`).
-  Still a dramatic contrast vs. the ~2300 ms serial path.
-- **Full 100:** raise Postgres limit. Add to the `postgres` service in
-  `docker-compose.demo.yml`:
-  ```yaml
-      command: ["postgres", "-c", "max_connections=250"]
-  ```
-  then set `QUEUE_DEMO_WORKER_COUNT=100`.
+- **Default:** `QUEUE_DEMO_WORKER_COUNT=50` — safe everywhere, already a dramatic
+  contrast vs. the ~2300 ms serial path.
+- **Full 100:** set `QUEUE_DEMO_WORKER_COUNT=100` — fits under the 250 limit
+  (backend pool tops out around 140 connections at 100 workers).
 
 (The right long-term fix is a shared connection pool / smaller per-worker
-session lifetime, but for the demo, tuning these two numbers is enough.)
+session lifetime, but for the demo, tuning the worker count is enough.)
 
 ---
 

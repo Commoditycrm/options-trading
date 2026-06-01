@@ -10,8 +10,8 @@ orders are detected and mirrored to many subscribers in parallel. Built on a
 of subscriber count.
 
 - **Repo:** `https://github.com/Commoditycrm/options-trading`
-- **Working branch:** `anitha-trade-features` (local only — NOT pushed yet)
-- **Parent branch:** `anitha-brokers` (fully committed, NOT pushed)
+- **Working branch:** `anitha-trade-features` (pushed + synced with origin)
+- **Parent branch:** `anitha-brokers` (pushed + synced with origin)
 - **Architecture doc:** `doc/ARCHITECTURE.md` (lag breakdown in §10)
 - **Deploy guide:** `doc/DEPLOY_LIGHTSAIL_DEMO.md`
 - **This file:** `doc/HANDOFF.md`
@@ -23,15 +23,16 @@ C:\Users\anith\Clade- Copy trading\options-trading\
 
 ## Git state right now
 ```
-branch:  anitha-trade-features   (latest work, local only)
-parent:  anitha-brokers          (local only)
+branch:  anitha-trade-features   (latest work, pushed + synced with origin)
+parent:  anitha-brokers          (pushed + synced with origin)
 remote:  origin → Commoditycrm/options-trading
 ```
-**Neither branch has been pushed.** First thing to do in a new session is push both:
+**Both branches are pushed and in sync with origin** — the box can `git clone`
+directly. To pull the latest before deploying:
 ```powershell
 cd "C:\Users\anith\Clade- Copy trading\options-trading"
-git push -u origin anitha-brokers
-git push -u origin anitha-trade-features
+git fetch origin
+git checkout anitha-trade-features && git pull
 ```
 
 ---
@@ -106,7 +107,7 @@ sudo usermod -aG docker $USER && newgrp docker
 ```bash
 git clone https://github.com/Commoditycrm/options-trading.git
 cd options-trading
-git checkout anitha-trade-features   # or anitha-brokers if not pushed yet
+git checkout anitha-trade-features
 ```
 
 ### Step 3 — Create secrets file
@@ -172,7 +173,6 @@ Steps:
 
 | Item | Effort | Notes |
 |------|--------|-------|
-| **Push branches to remote** | XS | First thing — `git push -u origin anitha-brokers && git push -u origin anitha-trade-features` |
 | **Frontend: broker dropdown** (Trade Panel, pick Alpaca vs Webull) | S | Backend done; needs UI dropdown + default-broker setter |
 | **Frontend: exclusion list** (tag-input on subscriber settings) | S | Backend done; needs UI |
 | **Frontend: TP/SL inputs** (subscriber settings) | S | Backend done; needs UI |
@@ -224,5 +224,5 @@ doc/
 - **Never touch `main` or Gaurav's branches** in `copy-trading-app`
 - **`options-trading` is App 2** — all our work goes here
 - **`anitha-trade-features` branches off `anitha-brokers`** — preserve that lineage
-- The demo DB (`optionhaven_demo`) is isolated from App 1 production
+- The demo DB (`signalboxx_demo`) is isolated from App 1 — its own Postgres container + volume on App 2's own Lightsail instance
 - `deploy/.env.demo` is gitignored — never commit secrets
