@@ -33,7 +33,11 @@ def upgrade() -> None:
     # before v12. All currently-supported versions are 12+.
     with op.get_context().autocommit_block():
         op.execute(
-            "ALTER TYPE order_status ADD VALUE IF NOT EXISTS 'retry_pending'"
+            # NB: enum value must be UPPERCASE to match SQLAlchemy's default
+            # behaviour for Python Enum columns (it sends the member NAME,
+            # not the .value). The rest of the order_status enum values
+            # (PENDING, SUBMITTED, FILLED, ...) are already uppercase.
+            "ALTER TYPE order_status ADD VALUE IF NOT EXISTS 'RETRY_PENDING'"
         )
 
     # ── 2. Create the retry_interval enum (used by both new columns) ───────
