@@ -20,7 +20,12 @@ class SubscriberSettingsOut(BaseModel):
     # Retry policy. NEVER (default) = no retry on broker-disconnect failures.
     retry_interval_open: RetryInterval = RetryInterval.NEVER
     retry_interval_close: RetryInterval = RetryInterval.NEVER
-    todays_realized_pnl: Decimal | None = None  # populated by GET endpoint, not by PATCH responses
+    todays_realized_pnl: Decimal | None = None
+    # Req #6: exclusion list
+    excluded_symbols: list[str] = []
+    # Req #4: auto TP/SL
+    take_profit_pct: Decimal | None = None
+    stop_loss_pct: Decimal | None = None
 
     model_config = {"from_attributes": True}
 
@@ -39,8 +44,20 @@ class TraderSettingsOut(BaseModel):
     trading_enabled: bool
     copy_paused: bool = False
     mirror_external_trades: bool = False
+    mirror_only_filled: bool = False
+    default_broker_account_id: uuid.UUID | None = None
 
     model_config = {"from_attributes": True}
+
+
+class TraderMirrorOnlyFilledIn(BaseModel):
+    mirror_only_filled: bool
+
+
+class TraderDefaultBrokerIn(BaseModel):
+    """Set (or clear) the default broker account for the Trade Panel dropdown.
+    Pass null to clear the preference."""
+    default_broker_account_id: uuid.UUID | None = None
 
 
 class SubscriberToggleIn(BaseModel):
@@ -73,6 +90,21 @@ class PerTradeLossLimitPctIn(BaseModel):
 class MaxDrawdownPctIn(BaseModel):
     """Max drawdown % below the equity baseline captured when enabled. Null to disable."""
     max_drawdown_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class ExcludedSymbolsIn(BaseModel):
+    """Req #6: replace the whole exclusion list. Pass [] to clear."""
+    excluded_symbols: list[str] = []
+
+
+class TakeProfitPctIn(BaseModel):
+    """Req #4: auto take-profit % above entry premium. Null to disable."""
+    take_profit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("1000"))
+
+
+class StopLossPctIn(BaseModel):
+    """Req #4: auto stop-loss % below entry premium. Null to disable."""
+    stop_loss_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
 
 
 class FollowTraderIn(BaseModel):

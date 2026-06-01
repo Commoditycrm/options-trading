@@ -58,6 +58,11 @@ class SubscriberCacheEntry:
     per_trade_loss_limit_pct: Decimal | None
     max_drawdown_pct: Decimal | None
     max_drawdown_equity_baseline: Decimal | None
+    # Req #6: tickers the subscriber refuses to copy (underlying, uppercase).
+    excluded_symbols: tuple[str, ...]
+    # Req #4: auto take-profit / stop-loss % for bracket orders (NULL = off).
+    take_profit_pct: Decimal | None
+    stop_loss_pct: Decimal | None
     broker_accounts: tuple[BrokerAccountSnapshot, ...]
 
 
@@ -82,6 +87,9 @@ def _build_entry(db: Session, sub: SubscriberSettings) -> SubscriberCacheEntry:
         per_trade_loss_limit_pct=sub.per_trade_loss_limit_pct,
         max_drawdown_pct=sub.max_drawdown_pct,
         max_drawdown_equity_baseline=sub.max_drawdown_equity_baseline,
+        excluded_symbols=tuple(s.upper() for s in (sub.excluded_symbols or [])),
+        take_profit_pct=sub.take_profit_pct,
+        stop_loss_pct=sub.stop_loss_pct,
         broker_accounts=tuple(
             BrokerAccountSnapshot(id=a.id, supports_fractional=a.supports_fractional)
             for a in accounts

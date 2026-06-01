@@ -9,14 +9,19 @@ from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
     DailyLossLimitPctIn,
+    ExcludedSymbolsIn,
     FollowTraderIn,
     MaxDrawdownPctIn,
     PerTradeLossLimitPctIn,
+    StopLossPctIn,
     SubscriberRetryIntervalIn,
     SubscriberSelfMultiplierIn,
     SubscriberSettingsOut,
     SubscriberToggleIn,
+    TakeProfitPctIn,
+    TraderDefaultBrokerIn,
     TraderMirrorExternalIn,
+    TraderMirrorOnlyFilledIn,
     TraderSettingsOut,
     TraderToggleIn,
 )
@@ -25,8 +30,7 @@ from app.services import audit
 
 
 def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
-    """Build the full subscriber-settings response, including the
-    percentage-based risk controls and today's realized P&L."""
+    """Build the full subscriber-settings response."""
     return SubscriberSettingsOut(
         user_id=s.user_id,
         following_trader_id=s.following_trader_id,
@@ -40,6 +44,9 @@ def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
         retry_interval_open=s.retry_interval_open,
         retry_interval_close=s.retry_interval_close,
         todays_realized_pnl=today_realized_pnl(db, s.user_id),
+        excluded_symbols=list(s.excluded_symbols or []),
+        take_profit_pct=s.take_profit_pct,
+        stop_loss_pct=s.stop_loss_pct,
     )
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -366,6 +373,133 @@ def toggle_mirror_external(
     db.commit()
     db.refresh(s)
     return s
+
+
+@router.patch("/trader/mirror-only-filled", response_model=TraderSettingsOut)
+def set_mirror_only_filled(
+    payload: TraderMirrorOnlyFilledIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> TraderSettings:
+    """Req #3: toggle whether only FILLED orders are mirrored (vs immediate)."""
+    s = db.get(TraderSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    s.mirror_only_filled = payload.mirror_only_filled
+    audit.record(db, actor_user_id=user.id, action="trader.mirror_only_filled_changed",
+                 entity_type="trader_settings", entity_id=user.id,
+                 metadata={"mirror_only_filled": payload.mirror_only_filled},
+                 ip_address=client_ip(request))
+    db.commit()
+    db.refresh(s)
+    return s
+
+
+@router.patch("/trader/default-broker", response_model=TraderSettingsOut)
+def set_default_broker(
+    payload: TraderDefaultBrokerIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> TraderSettings:
+    """Req #1: set (or clear) the default broker account for the Trade Panel dropdown."""
+    from app.models.broker_account import BrokerAccount
+    s = db.get(TraderSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    if payload.default_broker_account_id is not None:
+        acct = db.get(BrokerAccount, payload.default_broker_account_id)
+        if not acct or acct.user_id != user.id:
+            raise HTTPException(404, "broker_account_not_found")
+    s.default_broker_account_id = payload.default_broker_account_id
+    audit.record(db, actor_user_id=user.id, action="trader.default_broker_changed",
+                 entity_type="trader_settings", entity_id=user.id,
+                 metadata={"default_broker_account_id": str(payload.default_broker_account_id)
+                           if payload.default_broker_account_id else None},
+                 ip_address=client_ip(request))
+    db.commit()
+    db.refresh(s)
+    return s
+
+
+# ── Subscriber: exclusion list (Req #6) ────────────────────────────────────
+
+@router.patch("/subscriber/excluded-symbols", response_model=SubscriberSettingsOut)
+def set_excluded_symbols(
+    payload: ExcludedSymbolsIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Replace the subscriber's stock exclusion list (underlying tickers, e.g. AAPL).
+    Pass [] to clear. Uppercase is enforced on the backend."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = list(s.excluded_symbols or [])
+    s.excluded_symbols = [sym.upper().strip() for sym in payload.excluded_symbols if sym.strip()]
+    audit.record(db, actor_user_id=user.id, action="subscriber.excluded_symbols_changed",
+                 entity_type="subscriber_settings", entity_id=user.id,
+                 metadata={"old": old, "new": s.excluded_symbols},
+                 ip_address=client_ip(request))
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
+    db.refresh(s)
+    return _sub_out(s, db)
+
+
+# ── Subscriber: auto TP/SL (Req #4) ────────────────────────────────────────
+
+@router.patch("/subscriber/take-profit", response_model=SubscriberSettingsOut)
+def set_take_profit(
+    payload: TakeProfitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the auto take-profit % above entry premium for option brackets."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.take_profit_pct
+    s.take_profit_pct = payload.take_profit_pct
+    audit.record(db, actor_user_id=user.id, action="subscriber.take_profit_changed",
+                 entity_type="subscriber_settings", entity_id=user.id,
+                 metadata={"old": str(old) if old is not None else None,
+                           "new": str(payload.take_profit_pct) if payload.take_profit_pct is not None else None},
+                 ip_address=client_ip(request))
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
+    db.refresh(s)
+    return _sub_out(s, db)
+
+
+@router.patch("/subscriber/stop-loss", response_model=SubscriberSettingsOut)
+def set_stop_loss(
+    payload: StopLossPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the auto stop-loss % below entry premium for option brackets."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.stop_loss_pct
+    s.stop_loss_pct = payload.stop_loss_pct
+    audit.record(db, actor_user_id=user.id, action="subscriber.stop_loss_changed",
+                 entity_type="subscriber_settings", entity_id=user.id,
+                 metadata={"old": str(old) if old is not None else None,
+                           "new": str(payload.stop_loss_pct) if payload.stop_loss_pct is not None else None},
+                 ip_address=client_ip(request))
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
+    db.refresh(s)
+    return _sub_out(s, db)
 
 
 @router.get("/traders", response_model=list[dict])

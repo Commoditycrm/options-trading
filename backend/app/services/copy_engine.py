@@ -619,9 +619,19 @@ def dispatch_detected_order(db: Session, trader_order: Order, trader: User) -> d
     mirror orders. Falls back to Redis Streams or the in-process serial
     ``fanout`` when ``use_queue_fanout`` is disabled (legacy / comparison).
 
+    Req #3: if the trader has mirror_only_filled=True, non-filled orders are
+    silently skipped (not dispatched). The listener calls this on every status
+    update — we'll see the FILLED event eventually and dispatch then.
+
     Returns a small metadata dict the caller folds into its audit record.
     """
     from app.config import get_settings
+
+    # Req #3 — mirror-only-filled gate
+    ts = db.get(TraderSettings, trader.id)
+    if ts is not None and ts.mirror_only_filled:
+        if trader_order.status != OrderStatus.FILLED:
+            return {"dispatch": "skipped_not_filled", "status": trader_order.status.value}
 
     if getattr(get_settings(), "use_queue_fanout", True):
         # Commit so the trader Order row is visible to worker sessions before

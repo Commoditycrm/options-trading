@@ -200,6 +200,18 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
                     })
                     return "max_drawdown"
 
+        # ── Req #6: exclusion list (pure memory, zero DB) ──────────────────
+        if entry.excluded_symbols and trader_order.symbol.upper() in entry.excluded_symbols:
+            _record_outcome(db, pc, PendingCopyStatus.FAILED,
+                            f"excluded_symbol:{trader_order.symbol.upper()}")
+            return "excluded_symbol"
+
+        # ── Req #4 Replace mode: skip if trader is CLOSING a position that
+        # this subscriber is managing themselves via TP/SL bracket. ─────────
+        if trader_order.is_closing and (entry.take_profit_pct or entry.stop_loss_pct):
+            _record_outcome(db, pc, PendingCopyStatus.FAILED, "subscriber_managed_exit")
+            return "subscriber_managed_exit"
+
         if not entry.broker_accounts:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "no_broker")
             return "no_broker"
@@ -263,8 +275,75 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
             client_order_id=str(child.id),
         )
 
+        # ── Req #4: auto TP/SL bracket (Replace mode) ──────────────────────
+        # Compute TP/SL target prices from entry premium percentage.
+        # Only attempted when:
+        #   a) Subscriber has TP and/or SL configured
+        #   b) This is an OPENING order (not a close — Replace mode skips closes
+        #      via the earlier gate in the risk section)
+        #   c) We have a reference price (limit_price from the trader's order)
+        tp_price = None
+        sl_price = None
+        if not trader_order.is_closing and (entry.take_profit_pct or entry.stop_loss_pct):
+            ref_price = trader_order.limit_price or trader_order.stop_price
+            if ref_price is not None and ref_price > 0:
+                from decimal import Decimal as _Decimal
+                from app.models.order import OrderSide as _OS
+                multiplier = _Decimal(1) if trader_order.side == _OS.BUY else _Decimal(-1)
+                if entry.take_profit_pct:
+                    # For a BUY, TP is above entry; for SELL, below.
+                    tp_price = ref_price * (1 + multiplier * entry.take_profit_pct / _Decimal(100))
+                    tp_price = tp_price.quantize(_Decimal("0.01"))
+                if entry.stop_loss_pct:
+                    # For a BUY, SL is below entry; for SELL, above.
+                    sl_price = ref_price * (1 - multiplier * entry.stop_loss_pct / _Decimal(100))
+                    sl_price = sl_price.quantize(_Decimal("0.01"))
+
+        # Try bracket first (IBKR native OCA); fall back to plain entry if
+        # the adapter doesn't support it (e.g. Alpaca, Webull, Mock).
+        if tp_price is not None or sl_price is not None:
+            try:
+                resp = adapter.place_bracket_order(request, tp_price, sl_price)
+            except NotImplementedError:
+                log.info(
+                    "subscriber_worker: %s does not support bracket orders — "
+                    "falling back to plain entry for subscriber=%s",
+                    acct.broker.value, entry.user_id,
+                )
+                try:
+                    resp = place_order_with_recovery(adapter, request)
+                except (RecoverableOrderError, Exception) as exc:  # noqa: BLE001
+                    msg = (exc.friendly_message if isinstance(exc, RecoverableOrderError)
+                           else str(exc))
+                    child.status = OrderStatus.REJECTED
+                    child.reject_reason = msg[:480]
+                    child.closed_at = datetime.now(timezone.utc)
+                    audit.record(db, actor_user_id=entry.user_id, action="copy.error",
+                                 entity_type="order", entity_id=child.id,
+                                 metadata={"parent_order_id": str(trader_order.id),
+                                           "error": msg[:300], "path": "queue_bracket_fallback"})
+                    _record_outcome(db, pc, PendingCopyStatus.FAILED, msg[:200])
+                    events.publish(entry.user_id, _order_event("order.copy_failed", child))
+                    return "broker_failed"
+            except (RecoverableOrderError, Exception) as exc:  # noqa: BLE001
+                msg = (exc.friendly_message if isinstance(exc, RecoverableOrderError)
+                       else str(exc))
+                child.status = OrderStatus.REJECTED
+                child.reject_reason = msg[:480]
+                child.closed_at = datetime.now(timezone.utc)
+                audit.record(db, actor_user_id=entry.user_id, action="copy.error",
+                             entity_type="order", entity_id=child.id,
+                             metadata={"parent_order_id": str(trader_order.id),
+                                       "error": msg[:300], "path": "queue_bracket"})
+                _record_outcome(db, pc, PendingCopyStatus.FAILED, msg[:200])
+                events.publish(entry.user_id, _order_event("order.copy_failed", child))
+                return "broker_failed"
+        else:
+            # No bracket configured — plain entry path.
+            pass  # falls through to the block below
+
         try:
-            resp = place_order_with_recovery(adapter, request)
+            resp = place_order_with_recovery(adapter, request) if (tp_price is None and sl_price is None) else resp  # noqa: E501
         except (RecoverableOrderError, Exception) as exc:  # noqa: BLE001
             msg = (
                 exc.friendly_message if isinstance(exc, RecoverableOrderError)

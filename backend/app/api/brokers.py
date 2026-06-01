@@ -177,7 +177,17 @@ def _refresh_balance_into(acct: BrokerAccount, creds: dict[str, Any]) -> None:
 def _evict_existing_brokers(db: Session, user: User, request: Request) -> None:
     """One-broker-per-user: delete existing broker_account rows for this user
     and stop their listeners before inserting a new one. Order rows survive
-    (broker_account_id is SET NULL on delete)."""
+    (broker_account_id is SET NULL on delete).
+
+    Req #1 (Option B): TRADERS can connect multiple brokers (e.g. both Alpaca
+    and Webull) so they can pick which one to place each order from in the Trade
+    Panel. Eviction is skipped for traders — each new broker connect simply adds
+    a row. Subscribers remain one-broker-per-user (cleaner fanout semantics).
+    """
+    if user.role == UserRole.TRADER:
+        # Traders: allow multiple broker accounts. No eviction.
+        return
+
     existing = list(db.execute(
         select(BrokerAccount).where(BrokerAccount.user_id == user.id)
     ).scalars())

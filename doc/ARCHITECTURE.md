@@ -283,3 +283,105 @@ branches and needs porting into this repo on top of the queue architecture:
 - **Per-broker rate limiting**.
 - **Auto-deploy CI** for App 2 mirroring App 1's GitHub Actions workflow (separate Lightsail instance).
 - The scaling upgrades in §8 as volume grows.
+
+---
+
+## 10. Lag breakdown — inside vs outside our platform
+
+Critical for understanding what we can and cannot optimize. All timings are
+for a **1 trader + 100 subscribers** scenario on the options trading platform.
+
+```
+TRADER places an options order in their own broker app
+──────────────────────────────────────────────────────────────────────────────
+STAGE                        WHERE?          LATENCY        CAN WE CONTROL?
+──────────────────────────────────────────────────────────────────────────────
+Trader places order in their OUTSIDE         n/a            No — trader's
+own Webull / Alpaca app      (their broker)                 own action
+
+Broker accepts + routes      OUTSIDE         ~ms            No — broker
+the order internally         (broker-side)                  internal
+
+Detection (we observe        OUTSIDE         Alpaca WS < 1s No — imposed by
+trader's order)              (broker-imposed) Webull direct 2–4s  the broker's
+                                             SnapTrade poll 5s   API capability
+                                             (paid 5s tier)
+
+──────────────────────────────────────────────────────────────────────────────
+←── ABOVE IS OUTSIDE OUR PLATFORM ── BELOW IS INSIDE OUR PLATFORM ──────────
+──────────────────────────────────────────────────────────────────────────────
+
+Read 100 subscribers from    INSIDE          ~0 ms          Yes — memory
+in-memory cache              (our memory)                   cache design
+
+Batch INSERT 100 rows        INSIDE          ~5–8 ms        Yes — single
+into pending_copies          (our Postgres)                 batch insert
+
+Commit & return              INSIDE          ~5 ms          Yes
+(TRADER IS FREED HERE)
+
+Worker: claim 1 row          INSIDE          ~1 ms/worker   Yes — SKIP LOCKED
+(SELECT FOR UPDATE)          (our Postgres)
+
+Worker: risk gates from      INSIDE          ~5–10 ms       Yes — memory-first
+memory cache                 (our memory)                   design
+
+Worker: place mirror order   OUTSIDE         ~200–400 ms    No — broker
+at subscriber's IBKR         (IBKR broker)   (options)      network latency
+
+All 100 placed (GIL-bounded) INSIDE          ~2 s           Partially — see §5b
+                             (our process)                  for next optimizations
+
+──────────────────────────────────────────────────────────────────────────────
+AFTER OUR PLATFORM
+──────────────────────────────────────────────────────────────────────────────
+
+IBKR routes + matches        OUTSIDE         broker/venue   No
+option order at exchange     (exchange)      dependent
+```
+
+### End-to-end summary (SnapTrade trader, 100 IBKR subscribers)
+
+| Component | Time | Where |
+|---|---|---|
+| SnapTrade detects Webull order | ~5 s | **Outside** |
+| Our hot path (detect → queue → return) | ~15–20 ms | **Inside ✅** |
+| Worker gates + IBKR placement (all 100) | ~2 s | Inside + Outside |
+| **Total user-perceptible** | **~7 s** | Dominated by external detection |
+| **Trader blocked for** | **~15 ms** | Inside ✅ |
+
+### What this means for optimization priorities
+
+1. **Detection latency (~5 s)** — dominated by SnapTrade's polling cadence.
+   Upgrade path: enable the SnapTrade **webhook** (code already written) for
+   near-instant push detection. No code change needed on our side — just
+   configure a public webhook URL in the SnapTrade dashboard.
+
+2. **Hot path (~15–20 ms)** — already excellent. The trader is freed in ~15 ms
+   regardless of subscriber count. No optimization needed.
+
+3. **Drain (~2 s for 100 subs)** — GIL-bounded at current architecture.
+   Upgrade path: process-based workers (escape GIL) + batched row claims.
+   Not needed until subscriber count grows beyond ~200.
+
+4. **IBKR options placement (~200–400 ms per order)** — broker-side, outside our
+   control. IBKR is the fastest serious options broker available.
+
+### Broker-specific detection latency (outside our platform)
+
+| Trader broker | Detection method | Latency |
+|---|---|---|
+| Alpaca | WebSocket (push) | < 1 s |
+| Alpaca | REST poller (fallback) | 1–2 s |
+| Webull direct | 2 s poll | 2–4 s |
+| Webull via SnapTrade | 5 s poll (paid tier) | ~5 s |
+| Webull via SnapTrade + webhook | Push event | Near-instant |
+
+### Subscriber placement latency — by broker + instrument
+
+| Subscriber broker | Stock options placement | Notes |
+|---|---|---|
+| **IBKR** | ✅ ~200–400 ms | Primary subscriber broker; full option support including OCA bracket orders |
+| Alpaca | ✅ ~100–200 ms | Paper trading only (current); options placement supported |
+| Webull direct | ❌ Not yet | Options placement not built; stocks only currently |
+| Webull via SnapTrade | ❌ Not yet | Options placement needs SnapTrade options discovery flow |
