@@ -1,0 +1,102 @@
+# Production stack for the QUEUE-BASED Option Haven app on a single self-hosted
+# host (e.g. AWS Lightsail), behind Caddy with automatic Let's Encrypt TLS.
+#
+# How this differs from the deploy/lightsail-selfhosted prod stack
+# ----------------------------------------------------------------
+# That stack uses Redis Streams + a separate `worker` container for fanout.
+# THIS app (anitha-trade-features) uses the Postgres-backed queue
+# (`pending_copies`) drained by an in-process asyncio worker pool, so there is
+# NO Redis and NO separate worker container — the backend process runs the
+# workers itself (QUEUE_DEMO_WORKER_COUNT).
+#
+# Security model
+# --------------
+# - Only Caddy publishes ports (80/443). Postgres has NO `ports:` mapping, so
+#   it is reachable only on the private `internal` network by service name.
+# - Backend/frontend are not published either; Caddy reverse-proxies to them
+#   over the internal network and terminates TLS.
+#
+# Bring up:   docker compose -f docker-compose.prod.yml up -d --build
+# Logs:       docker compose -f docker-compose.prod.yml logs -f backend
+# Migrate:    runs automatically (alembic upgrade head in the backend CMD)
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    # Headroom for the in-process worker pool (each worker holds a DB
+    # connection while claiming + submitting). See doc/ARCHITECTURE.md §8.
+    command: ["postgres", "-c", "max_connections=250"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+    # NB: deliberately NO `ports:` — the DB is internal-only.
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    # env_file lets you add IBKR_* / SNAPTRADE_* creds later without editing
+    # this file. The explicit `environment:` block below takes precedence.
+    env_file: .env
+    environment:
+      # The app normalizes postgresql:// to psycopg itself (app/database.py).
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: HS256
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      # Same-origin behind Caddy — both just need to match the public URL.
+      CORS_ORIGINS: ${PUBLIC_URL}
+      FRONTEND_BASE_URL: ${PUBLIC_URL}
+      # In-process queue worker pool. No Redis on this stack.
+      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-50}
+      RUN_FANOUT_WORKER_IN_PROCESS: "false"
+      LOG_LEVEL: INFO
+    depends_on:
+      db: {condition: service_healthy}
+    networks: [internal]
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    # SSR fallback for /api/* — Caddy handles /api/* directly in normal
+    # operation; client fetches use relative /api/* (same origin via Caddy).
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+    networks: [internal]
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+      - backend
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
