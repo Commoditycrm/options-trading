@@ -11,6 +11,9 @@ from app.models.base import Base, TimestampMixin
 class UserRole(str, enum.Enum):
     TRADER = "trader"
     SUBSCRIBER = "subscriber"
+    # Platform operator. Not created via registration — use
+    # scripts/create_admin.py. Gates /api/admin/* + the /admin frontend.
+    ADMIN = "admin"
 
 
 class User(Base, TimestampMixin):

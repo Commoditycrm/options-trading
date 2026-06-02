@@ -42,6 +42,7 @@ from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
+from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, events
@@ -52,6 +53,29 @@ from app.services.pnl import today_realized_pnl
 log = logging.getLogger(__name__)
 
 MAX_PARALLEL = 32
+
+# Grace window for listener-detected orders: an order whose broker-side
+# placement time is older than (broker_account.created_at - this) is treated
+# as pre-connection history and NOT mirrored. See order_predates_connection.
+FANOUT_HISTORICAL_GRACE_S = 120
+
+
+def order_predates_connection(
+    broker_account: "BrokerAccount | None",
+    order_placed_at: "datetime | None",
+) -> bool:
+    """True if a listener-detected order was placed before we began watching
+    the trader's broker (so it's history and must NOT be mirrored). Compares
+    the order's broker-side placement time against broker_account.created_at
+    minus a grace window. Fail-open (False → allow) when a timestamp is
+    missing — dropping a real just-placed trade is worse than occasionally
+    mirroring one borderline historical order."""
+    if order_placed_at is None or broker_account is None or broker_account.created_at is None:
+        return False
+    placed = order_placed_at if order_placed_at.tzinfo else order_placed_at.replace(tzinfo=timezone.utc)
+    created = broker_account.created_at
+    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    return placed < created - timedelta(seconds=FANOUT_HISTORICAL_GRACE_S)
 
 
 @dataclass
@@ -538,6 +562,94 @@ def fanout(db: Session, trader_order: Order, trader: User) -> list[FanoutResult]
             lambda t: process_one_fanout(trader_order.id, t),
             targets,
         ))
+
+
+# ─── Queue-based fanout (demo) ──────────────────────────────────────────────
+
+def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
+    """Demo replacement for ``fanout``: enumerates eligible subscribers
+    from the in-memory cache and batch-inserts one ``pending_copies`` row
+    per subscriber-broker pair, then returns. NO eligibility checks, NO
+    broker calls in this code path — those happen in the worker pool
+    (services.subscriber_worker).
+
+    Returns the number of rows queued. Target latency: <10ms for 100 subs.
+    """
+    from app.services import memory_cache
+
+    if trader.role != UserRole.TRADER:
+        return 0
+    ts = db.get(TraderSettings, trader.id)
+    if ts is None or not ts.trading_enabled or ts.copy_paused:
+        return 0
+
+    subs = memory_cache.subscribers_for_trader(trader.id)
+    if not subs:
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    for entry in subs:
+        # We still enqueue subscribers with no broker so the worker can
+        # surface a "skipped_no_broker" row in the dashboard. Cheap.
+        if not entry.copy_enabled:
+            continue
+        if entry.following_trader_id != trader.id:
+            continue
+        rows.append({
+            "id": uuid.uuid4(),
+            "parent_order_id": trader_order.id,
+            "subscriber_user_id": entry.user_id,
+            "status": PendingCopyStatus.QUEUED.value,
+        })
+
+    if not rows:
+        return 0
+
+    # Single batch insert. Postgres can chew through 100 rows in ~5ms.
+    db.execute(PendingCopy.__table__.insert(), rows)
+    db.commit()
+    return len(rows)
+
+
+def dispatch_detected_order(db: Session, trader_order: Order, trader: User) -> dict[str, Any]:
+    """Single dispatch entrypoint for a freshly-detected trader order.
+
+    App 2 default = the queue-based fast path (``queue_fanout``): the
+    detection handler returns in ~8ms and the async worker pool places the
+    mirror orders. Falls back to Redis Streams or the in-process serial
+    ``fanout`` when ``use_queue_fanout`` is disabled (legacy / comparison).
+
+    Req #3: if the trader has mirror_only_filled=True, non-filled orders are
+    silently skipped (not dispatched). The listener calls this on every status
+    update — we'll see the FILLED event eventually and dispatch then.
+
+    Returns a small metadata dict the caller folds into its audit record.
+    """
+    from app.config import get_settings
+
+    # Req #3 — mirror-only-filled gate
+    ts = db.get(TraderSettings, trader.id)
+    if ts is not None and ts.mirror_only_filled:
+        if trader_order.status != OrderStatus.FILLED:
+            return {"dispatch": "skipped_not_filled", "status": trader_order.status.value}
+
+    if getattr(get_settings(), "use_queue_fanout", True):
+        # Commit so the trader Order row is visible to worker sessions before
+        # we enqueue pending_copies rows that FK-reference it.
+        db.commit()
+        queued = queue_fanout(db, trader_order, trader)
+        return {"dispatch": "queue", "queued": queued}
+
+    # ── Legacy dispatch paths (only when use_queue_fanout=False) ──────────
+    from app.services import fanout_stream
+    targets = enumerate_fanout_targets(db, trader.id)
+    if fanout_stream.is_configured():
+        count = fanout_stream.publish_targets(trader_order.id, targets)
+        db.commit()
+        return {"dispatch": "redis_stream", "target_count": count}
+    db.commit()
+    fanout(db, trader_order, trader)
+    return {"dispatch": "in_process", "target_count": len(targets)}
 
 
 def _order_event(event_type: str, order: Order) -> dict[str, Any]:

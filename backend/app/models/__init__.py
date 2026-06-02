@@ -3,6 +3,7 @@ from app.models.base import Base
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.notification import Notification
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
+from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 
@@ -18,6 +19,8 @@ __all__ = [
     "OrderSide",
     "OrderStatus",
     "OrderType",
+    "PendingCopy",
+    "PendingCopyStatus",
     "RetryInterval",
     "SubscriberSettings",
     "TraderSettings",

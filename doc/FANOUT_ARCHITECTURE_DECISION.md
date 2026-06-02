@@ -62,7 +62,7 @@ Trader places direct at broker         Or trader uses our Trade Panel
                           XADD one message per (subscriber, broker_account)
                                        │
                                        ▼
-                       [Redis Stream: signalboxx:fanout]
+                       [Redis Stream: optionhaven:fanout]
                                        │
                           XREADGROUP (consumer group: fanout_workers)
                                        │

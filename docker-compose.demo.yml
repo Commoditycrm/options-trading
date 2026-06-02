@@ -1,0 +1,90 @@
+# Side-by-side QUEUE DEMO stack for a single AWS Lightsail instance.
+#
+#   nginx (:80/:443)  ──/api/*──▶  backend  (FastAPI + 100 asyncio workers)
+#                     └──/*─────▶  frontend (Next.js)
+#                                     │
+#                                  postgres (demo DB, isolated from prod)
+#
+# Bring up:   docker compose -f docker-compose.demo.yml --env-file deploy/.env.demo up -d --build
+# Logs:       docker compose -f docker-compose.demo.yml logs -f backend
+# Migrate:    runs automatically (alembic upgrade head in the backend CMD)
+#
+# This stack is intentionally separate from the local-dev docker-compose.yml
+# (which only provisions db + redis for `uvicorn` running on the host).
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    # Raise max_connections so a full QUEUE_DEMO_WORKER_COUNT=100 worker pool
+    # (each worker holds a DB connection while claiming + submitting) plus the
+    # backend's own pool fit comfortably under the limit. Default is 100,
+    # which 100 workers would exhaust. See doc/ARCHITECTURE.md §8.
+    command: ["postgres", "-c", "max_connections=250"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-optionhaven}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in deploy/.env.demo}
+      POSTGRES_DB: ${POSTGRES_DB:-optionhaven_demo}
+    volumes:
+      - demo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-optionhaven}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-optionhaven}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-optionhaven_demo}
+      JWT_SECRET: ${JWT_SECRET:?set in deploy/.env.demo}
+      JWT_ALGORITHM: HS256
+      JWT_ACCESS_TOKEN_MINUTES: "30"
+      JWT_REFRESH_TOKEN_DAYS: "14"
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY:?Fernet key, set in deploy/.env.demo}
+      # Same-origin behind Nginx — these just need to match the public URL.
+      CORS_ORIGINS: ${PUBLIC_URL:-http://localhost}
+      FRONTEND_BASE_URL: ${PUBLIC_URL:-http://localhost}
+      # Queue-demo worker pool size. 100 hits Postgres default max_connections
+      # ceiling once every worker holds a claim+submit connection — keep at 50
+      # unless you raised max_connections (see deploy guide).
+      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-50}
+      # Redis not needed for the queue-demo path (queue lives in Postgres).
+      LOG_LEVEL: INFO
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # Server-side rewrites (non-/api SSR fetches) go to the backend container.
+    # Client-side fetches use relative /api/* handled by Nginx.
+    environment:
+      BACKEND_URL: http://backend:8000
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Mount certs here after running certbot (see deploy guide). Optional
+      # for an HTTP-only demo.
+      - ./deploy/certs:/etc/nginx/certs:ro
+
+volumes:
+  demo_pgdata:

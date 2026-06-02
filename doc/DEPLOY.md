@@ -25,7 +25,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 Set `CREDENTIAL_ENCRYPTION_KEY` to that value. **Never rotate this in place** — every encrypted broker credential in the DB will become unreadable.
 
-3. **Update `CORS_ORIGINS` and `FRONTEND_BASE_URL`** in `render.yaml` to match your actual Vercel URL (default assumes `copy-trading-app.vercel.app`).
+3. **Update `CORS_ORIGINS` and `FRONTEND_BASE_URL`** in `render.yaml` to match this app's own public URL. (The Lightsail deploy — see `DEPLOY_LIGHTSAIL_DEMO.md` — sets these from `PUBLIC_URL` and ignores `render.yaml`.)
 
 4. **Free tier limitation:** the service spins down after 15 minutes of inactivity. When it spins down, the Alpaca trade-update WebSocket dies and any open SSE connection drops. The next request wakes it (30+ second cold start) and the stream reconnects. **Bump to the Starter plan ($7/mo) before going live** — the always-on guarantee is what makes the streaming features work in production.
 
@@ -36,8 +36,8 @@ Set `CREDENTIAL_ENCRYPTION_KEY` to that value. **Never rotate this in place** �
 
    | Name | Value | Why |
    |---|---|---|
-   | `BACKEND_URL` | `https://signalboxx-backend.onrender.com` | Used server-side by `next.config.js`'s rewrite, so the browser's `/api/*` calls proxy through Next.js to Render. Not exposed to the browser. |
-   | `NEXT_PUBLIC_API_BASE_URL` | `https://signalboxx-backend.onrender.com` | Exposed to the browser. Used **only by the SSE client (`lib/sse.ts`)** so the EventSource hits Render directly, bypassing Vercel's proxy (which would time out long connections at ~30–60s). |
+   | `BACKEND_URL` | `https://optionhaven-backend.onrender.com` | Used server-side by `next.config.js`'s rewrite, so the browser's `/api/*` calls proxy through Next.js to Render. Not exposed to the browser. |
+   | `NEXT_PUBLIC_API_BASE_URL` | `https://optionhaven-backend.onrender.com` | Exposed to the browser. Used **only by the SSE client (`lib/sse.ts`)** so the EventSource hits Render directly, bypassing Vercel's proxy (which would time out long connections at ~30–60s). |
 
 3. Redeploy the frontend. Test by opening the Trades page and confirming the SSE event stream stays connected past 60s (network tab → `/api/events` → "EventStream" should stay open).
 
@@ -58,7 +58,7 @@ When the team is ready for AWS:
 
 | Variable | Where | Notes |
 |---|---|---|
-| `DATABASE_URL` | backend | Postgres connection string. Render fills it automatically from `signalboxx-db`. |
+| `DATABASE_URL` | backend | Postgres connection string. Render fills it automatically from `optionhaven-db`. |
 | `JWT_SECRET` | backend | 256-bit base64. Render generates it. **Never rotate in place** — invalidates all live sessions. |
 | `JWT_ALGORITHM` | backend | `HS256`. Don't change unless you've coordinated with the frontend. |
 | `JWT_ACCESS_TOKEN_MINUTES` | backend | `30` default. |
@@ -85,7 +85,7 @@ The copy-trade fanout uses Redis Streams + Consumer Groups so multiple worker pr
 
 **Scaling to a dedicated worker service** (when single-pod isn't enough):
 
-1. In `render.yaml`, uncomment the `signalboxx-fanout-worker` block.
+1. In `render.yaml`, uncomment the `optionhaven-fanout-worker` block.
 2. Set `RUN_FANOUT_WORKER_IN_PROCESS=false` on the backend so you don't have two consumers competing.
 3. Deploy. The worker service runs `python worker.py` and consumes from the same stream/group as the in-process worker did. Scale the worker count up/down independently of the backend.
 
@@ -93,14 +93,14 @@ The copy-trade fanout uses Redis Streams + Consumer Groups so multiple worker pr
 
 ```bash
 # Show pending messages waiting on the consumer group
-redis-cli XPENDING signalboxx:fanout fanout_workers
+redis-cli XPENDING optionhaven:fanout fanout_workers
 
 # Show stream metadata + active consumers
-redis-cli XINFO STREAM signalboxx:fanout
-redis-cli XINFO CONSUMERS signalboxx:fanout fanout_workers
+redis-cli XINFO STREAM optionhaven:fanout
+redis-cli XINFO CONSUMERS optionhaven:fanout fanout_workers
 
 # Read the last 10 messages (regardless of consumer group)
-redis-cli XREVRANGE signalboxx:fanout + - COUNT 10
+redis-cli XREVRANGE optionhaven:fanout + - COUNT 10
 ```
 
 ### IBKR onboarding (one-time, app-level)

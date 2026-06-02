@@ -203,25 +203,16 @@ def _handle_external_order(
         },
     )
 
-    targets = enumerate_fanout_targets(db, owner.id)
-    if fanout_stream.is_configured():
-        count = fanout_stream.publish_targets(order.id, targets)
-        audit.record(
-            db, actor_user_id=owner.id, action="trader.fanout_dispatched",
-            entity_type="order", entity_id=order.id,
-            metadata={
-                "dispatch": "redis_stream",
-                "source": "rest_poller_external",
-                "target_count": count,
-            },
-        )
-        db.commit()
-    else:
-        # In-process fanout fallback (no Redis configured)
-        db.commit()
-        from app.services.copy_engine import fanout as _fanout_in_process
-        _fanout_in_process(db, order, owner)
-        db.commit()
+    # Dispatch via the unified entrypoint — queue-based fast path by default,
+    # with Redis-Streams / in-process serial as legacy fallbacks.
+    from app.services.copy_engine import dispatch_detected_order
+    result = dispatch_detected_order(db, order, owner)
+    audit.record(
+        db, actor_user_id=owner.id, action="trader.fanout_dispatched",
+        entity_type="order", entity_id=order.id,
+        metadata={"source": "rest_poller_external", **result},
+    )
+    db.commit()
 
     return order
 

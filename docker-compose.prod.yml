@@ -1,21 +1,31 @@
-# Production stack for a single self-hosted host (e.g. AWS Lightsail).
+# Production stack for the QUEUE-BASED Option Haven app on a single self-hosted
+# host (e.g. AWS Lightsail), behind Caddy with automatic Let's Encrypt TLS.
+#
+# How this differs from the deploy/lightsail-selfhosted prod stack
+# ----------------------------------------------------------------
+# That stack uses Redis Streams + a separate `worker` container for fanout.
+# THIS app (anitha-trade-features) uses the Postgres-backed queue
+# (`pending_copies`) drained by an in-process asyncio worker pool, so there is
+# NO Redis and NO separate worker container — the backend process runs the
+# workers itself (QUEUE_DEMO_WORKER_COUNT).
 #
 # Security model
 # --------------
-# - Only Caddy publishes ports (80/443). Postgres and Redis have NO `ports:`
-#   mapping, so they are reachable ONLY on the private `internal` Docker
-#   network by service name — never from the public internet.
-# - Redis requires a password (`--requirepass`); Postgres uses a strong
-#   password. Both come from the gitignored `.env` file (see .env.prod.example).
-# - Backend/worker/frontend are not published either; Caddy reverse-proxies to
-#   them over the internal network and terminates TLS.
+# - Only Caddy publishes ports (80/443). Postgres has NO `ports:` mapping, so
+#   it is reachable only on the private `internal` network by service name.
+# - Backend/frontend are not published either; Caddy reverse-proxies to them
+#   over the internal network and terminates TLS.
 #
 # Bring up:   docker compose -f docker-compose.prod.yml up -d --build
-# Logs:       docker compose -f docker-compose.prod.yml logs -f
+# Logs:       docker compose -f docker-compose.prod.yml logs -f backend
+# Migrate:    runs automatically (alembic upgrade head in the backend CMD)
 services:
   db:
     image: postgres:16
     restart: unless-stopped
+    # Headroom for the in-process worker pool (each worker holds a DB
+    # connection while claiming + submitting). See doc/ARCHITECTURE.md §8.
+    command: ["postgres", "-c", "max_connections=250"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -30,76 +40,39 @@ services:
     networks: [internal]
     # NB: deliberately NO `ports:` — the DB is internal-only.
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    # requirepass closes the unauthenticated-Redis RCE hole; AOF on for
-    # durability of the fanout stream across restarts.
-    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
-    environment:
-      # Expose the password inside the container so the healthcheck's
-      # in-container shell can read it ($$ defers expansion to the container).
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    networks: [internal]
-    # NB: deliberately NO `ports:` — Redis is internal-only.
-
   backend:
     build: ./backend
     restart: unless-stopped
+    # env_file lets you add IBKR_* / SNAPTRADE_* creds later without editing
+    # this file. The explicit `environment:` block below takes precedence.
     env_file: .env
     environment:
-      # Wire the app to the internal services. The app normalizes the
-      # postgresql:// scheme to psycopg itself (see app/database.py).
+      # The app normalizes postgresql:// to psycopg itself (app/database.py).
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      # Dedicated `worker` service handles fanout — don't double-consume.
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALGORITHM: HS256
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      # Same-origin behind Caddy — both just need to match the public URL.
+      CORS_ORIGINS: ${PUBLIC_URL}
+      FRONTEND_BASE_URL: ${PUBLIC_URL}
+      # In-process queue worker pool. No Redis on this stack.
+      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-50}
       RUN_FANOUT_WORKER_IN_PROCESS: "false"
+      LOG_LEVEL: INFO
     depends_on:
       db: {condition: service_healthy}
-      redis: {condition: service_healthy}
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    networks: [internal]
-
-  worker:
-    build: ./backend
-    restart: unless-stopped
-    command: ["python", "worker.py"]
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-      RUN_FANOUT_WORKER_IN_PROCESS: "false"
-    depends_on:
-      backend: {condition: service_healthy}
     networks: [internal]
 
   frontend:
     build:
       context: ./frontend
-      args:
-        # Browser SSE client hits the same public origin; Caddy routes
-        # /api/* straight to the backend (bypassing the Next proxy so long
-        # SSE streams aren't cut off).
-        NEXT_PUBLIC_API_BASE_URL: ${PUBLIC_URL}
     restart: unless-stopped
+    # SSR fallback for /api/* — Caddy handles /api/* directly in normal
+    # operation; client fetches use relative /api/* (same origin via Caddy).
     environment:
-      # Server-side Next rewrite fallback for /api/* (SSR). Caddy handles
-      # /api/* directly in normal operation.
       BACKEND_URL: http://backend:8000
     depends_on:
-      backend: {condition: service_healthy}
+      - backend
     networks: [internal]
 
   caddy:
@@ -125,6 +98,5 @@ networks:
 
 volumes:
   pgdata:
-  redisdata:
   caddy_data:
   caddy_config:

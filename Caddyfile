@@ -1,5 +1,8 @@
 # Caddy reverse proxy with automatic Let's Encrypt TLS.
 # {$DOMAIN} is read from the environment (set in .env, passed by compose).
+#
+# Works with sslip.io hostnames (e.g. 3.21.151.16.sslip.io) so you get a real
+# HTTPS cert with no DNS setup — the IP is encoded in the hostname.
 {$DOMAIN} {
 	encode gzip zstd
 

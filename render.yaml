@@ -1,4 +1,4 @@
-# Render blueprint for the SignalBoxx backend.
+# Render blueprint for the Option Haven backend.
 #
 # Frontend stays on Vercel (deployed via the existing vercel.json). This file
 # only provisions the FastAPI backend + Postgres on Render.
@@ -29,7 +29,7 @@
 
 services:
   - type: web
-    name: signalboxx-backend
+    name: optionhaven-backend
     runtime: python
     plan: free            # bump to "starter" ($7/mo) for always-on — free tier
                           # spins down after 15min idle, dropping the Alpaca
@@ -48,7 +48,7 @@ services:
     envVars:
       - key: DATABASE_URL
         fromDatabase:
-          name: signalboxx-db
+          name: optionhaven-db
           property: connectionString
       - key: JWT_SECRET
         generateValue: true        # 256-bit random base64; safe for HS256
@@ -61,10 +61,14 @@ services:
       - key: CREDENTIAL_ENCRYPTION_KEY
         sync: false                # MUST be set manually via dashboard
                                    # (see "First-time setup" above)
+      # NOTE: App 2 (Option Haven) deploys to Lightsail via
+      # docker-compose.demo.yml, which sets these from PUBLIC_URL. This
+      # render.yaml is unused for that path — set to App 2's own public URL
+      # only if you ever deploy this app on Render. Do NOT point at App 1.
       - key: CORS_ORIGINS
-        value: https://copy-trading-app.vercel.app
+        value: https://YOUR_OPTIONS_TRADING_PUBLIC_URL
       - key: FRONTEND_BASE_URL
-        value: https://copy-trading-app.vercel.app
+        value: https://YOUR_OPTIONS_TRADING_PUBLIC_URL
       - key: PYTHON_VERSION
         value: "3.11.9"
       # Redis Streams for parallel copy-trade fan-out. See doc/DEPLOY.md
@@ -90,7 +94,7 @@ services:
   # backend (above) so you don't run two consumer instances by accident.
   #
   # - type: worker
-  #   name: signalboxx-fanout-worker
+  #   name: optionhaven-fanout-worker
   #   runtime: python
   #   plan: starter
   #   rootDir: backend
@@ -99,7 +103,7 @@ services:
   #   envVars:
   #     - key: DATABASE_URL
   #       fromDatabase:
-  #         name: signalboxx-db
+  #         name: optionhaven-db
   #         property: connectionString
   #     - key: CREDENTIAL_ENCRYPTION_KEY
   #       sync: false
@@ -109,8 +113,8 @@ services:
   #       value: "3.11.9"
 
 databases:
-  - name: signalboxx-db
+  - name: optionhaven-db
     plan: free               # 1GB, 90-day expiry on free tier — fine for dev,
                              # upgrade to "starter" before going live.
-    databaseName: signalboxx
-    user: signalboxx
+    databaseName: optionhaven
+    user: optionhaven

@@ -1,0 +1,84 @@
+# Deploy Option Haven to the Lightsail host over SSH.
+#
+# Trigger: on merge/push to `main`, plus a manual "Run workflow" button.
+# What it does: SSH into the box, fast-forward the deployed checkout to the
+# target ref, rebuild the Docker stack, prune old images, and health-check.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST     — public IP or host of the Lightsail box (e.g. 3.21.151.16)
+#   DEPLOY_USER     — SSH user (e.g. ubuntu)
+#   DEPLOY_SSH_KEY  — PRIVATE SSH key (full PEM contents) authorized on the box
+#
+# Notes:
+# - The app's `.env` lives on the box (gitignored) and is never touched here.
+# - Migrations run automatically inside the backend container at startup.
+# - The deployed checkout on the box is ~/optionhaven.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref/branch to deploy"
+        required: false
+        default: main
+
+# Never run two deploys at once; let an in-flight deploy finish.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # For manual runs use the chosen ref; for push events deploy main.
+      DEPLOY_REF: ${{ github.event.inputs.ref || 'main' }}
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DEPLOY_REF
+          command_timeout: 20m
+          script: |
+            set -euo pipefail
+            APP_DIR="$HOME/optionhaven"
+            COMPOSE="docker-compose.prod.yml"
+
+            echo "==> Deploying ref '$DEPLOY_REF' to $APP_DIR"
+            cd "$APP_DIR"
+
+            # Sync the checkout to the target ref (force to avoid drift).
+            git fetch --all --prune
+            git checkout "$DEPLOY_REF"
+            git reset --hard "origin/$DEPLOY_REF"
+            echo "==> Now at: $(git log --oneline -1)"
+
+            # Rebuild + restart (migrations run in the backend CMD on boot).
+            sudo docker compose -f "$COMPOSE" up -d --build --remove-orphans
+            sudo docker image prune -f
+
+            # Health check against the public domain (read from the box .env).
+            DOMAIN="$(grep -E '^DOMAIN=' .env | cut -d= -f2-)"
+            echo "==> Waiting for https://$DOMAIN/api/health"
+            ok=0
+            for i in $(seq 1 30); do
+              if curl -fsS "https://$DOMAIN/api/health" >/dev/null 2>&1; then
+                echo "==> Healthy ✅"; ok=1; break
+              fi
+              echo "   ...waiting ($i/30)"; sleep 5
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "==> Health check FAILED ❌ — recent backend logs:"
+              sudo docker compose -f "$COMPOSE" logs --tail=60 backend || true
+              exit 1
+            fi
+
+            echo "==> Deploy complete."
+            sudo docker compose -f "$COMPOSE" ps

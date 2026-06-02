@@ -96,3 +96,18 @@ class BrokerAdapter(ABC):
     def get_positions(self) -> list[BrokerPosition]:
         """List currently held positions at this broker account."""
         raise NotImplementedError
+
+    def place_bracket_order(
+        self,
+        req: BrokerOrderRequest,
+        take_profit_price: "Decimal | None",
+        stop_loss_price: "Decimal | None",
+    ) -> BrokerOrderResult:
+        """Place an entry order with an attached OCA bracket (take-profit +
+        stop-loss). The bracket cancels the other leg when one fills.
+
+        Raises NotImplementedError when the broker/adapter doesn't support
+        native brackets — callers should fall back to ``place_order`` and
+        log a warning. Not every broker supports this for options.
+        """
+        raise NotImplementedError

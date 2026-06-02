@@ -257,6 +257,108 @@ class IbkrAdapter(BrokerAdapter):
             filled_avg_price=_dec_or_none(data.get("avg_price")),
         )
 
+    def place_bracket_order(
+        self,
+        req: BrokerOrderRequest,
+        take_profit_price: "Decimal | None",
+        stop_loss_price: "Decimal | None",
+    ) -> BrokerOrderResult:
+        """Place an option entry + OCA bracket (TP limit + SL stop) via IBKR.
+
+        IBKR's bracket = three orders in the same OCA group:
+          1. Parent entry (BUY for opening; SELL for closing) — market or limit.
+          2. Take-profit child — limit order at take_profit_price on the opposite side.
+          3. Stop-loss child — stop order at stop_loss_price on the opposite side.
+
+        IBKR lets us submit all three in one batch; only the first filled child
+        cancels the other. The OCA group name is derived from client_order_id
+        for traceability.
+
+        If neither TP nor SL price is provided, falls back to a plain entry order.
+        """
+        if take_profit_price is None and stop_loss_price is None:
+            return self.place_order(req)
+
+        c = self._c()
+        conid = self._resolve_conid(req)
+        oca_group = f"oca-{req.client_order_id or 'bracket'}"
+        acct = self.credentials["account_id"]
+
+        # Determine exit side (opposite of entry).
+        from app.models.order import OrderSide
+        exit_side = "SELL" if req.side == OrderSide.BUY else "BUY"
+
+        # ── Parent entry order ──────────────────────────────────────────────
+        parent_body: dict = {
+            "conid": conid,
+            "orderType": _TYPE_OUT[req.order_type],
+            "side": _SIDE_OUT[req.side],
+            "tif": _TIF_OUT,
+            "quantity": float(req.quantity),
+            "ocaGroup": oca_group,
+            "ocaType": 1,   # 1 = cancel on any fill
+        }
+        if req.limit_price is not None:
+            parent_body["price"] = float(req.limit_price)
+        if req.client_order_id:
+            parent_body["cOID"] = req.client_order_id
+
+        orders_batch = [parent_body]
+
+        # ── Take-profit child (limit) ───────────────────────────────────────
+        if take_profit_price is not None:
+            orders_batch.append({
+                "conid": conid,
+                "orderType": "LMT",
+                "side": exit_side,
+                "tif": "GTC",
+                "quantity": float(req.quantity),
+                "price": float(take_profit_price),
+                "ocaGroup": oca_group,
+                "ocaType": 1,
+            })
+
+        # ── Stop-loss child (stop) ──────────────────────────────────────────
+        if stop_loss_price is not None:
+            orders_batch.append({
+                "conid": conid,
+                "orderType": "STP",
+                "side": exit_side,
+                "tif": "GTC",
+                "quantity": float(req.quantity),
+                "auxPrice": float(stop_loss_price),
+                "ocaGroup": oca_group,
+                "ocaType": 1,
+            })
+
+        # Submit all orders in a single batch. IBKR processes them atomically.
+        resp = c.place_orders(
+            account_id=acct,
+            orders=orders_batch,
+        )
+        data = getattr(resp, "data", None) or []
+        if isinstance(data, list) and data:
+            first = data[0]
+        elif isinstance(data, dict):
+            first = data
+        else:
+            first = {}
+
+        if not first or ("order_id" not in first and "id" not in first):
+            raise RuntimeError(
+                f"IBKR bracket didn't place (response: {data!r}). "
+                "Likely a confirmation prompt that ibind didn't auto-answer."
+            )
+        broker_order_id = str(first.get("order_id") or first.get("id"))
+        status_text = str(first.get("order_status") or first.get("status") or "Submitted")
+        return BrokerOrderResult(
+            broker_order_id=broker_order_id,
+            status=_STATUS_IN.get(status_text, OrderStatus.SUBMITTED),
+            submitted_at=datetime.now(timezone.utc),
+            filled_quantity=_dec_or_none(first.get("filled_quantity")) or Decimal(0),
+            filled_avg_price=_dec_or_none(first.get("avg_price")),
+        )
+
     def get_order(self, broker_order_id: str) -> BrokerOrderResult:
         c = self._c()
         resp = c.live_orders()

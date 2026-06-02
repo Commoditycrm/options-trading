@@ -46,3 +46,7 @@ next-env.d.ts
 
 # ── Local Claude Code session state ────────────────────────────────────────
 .claude/
+
+# ── Demo deploy secrets / TLS certs ────────────────────────────────────────
+deploy/.env.demo
+deploy/certs/

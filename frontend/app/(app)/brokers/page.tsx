@@ -282,7 +282,7 @@ export default function BrokersPage() {
       <section className="card p-5 space-y-4 max-w-lg">
         <h2 className="font-semibold">Connect an Interactive Brokers account</h2>
         <p className="text-xs" style={{ color: "var(--muted)" }}>
-          IBKR uses OAuth 1.0a. Your operator (the SignalBoxx admin) registers the
+          IBKR uses OAuth 1.0a. Your operator (the Option Haven admin) registers the
           app with IBKR via{" "}
           <a href="https://www.interactivebrokers.com/campus/ibkr-api-page/oauth-1-0a-extended/" target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--accent)" }}>IBKR's third-party API onboarding</a>.
           You authorize the app against your account and paste the resulting

@@ -30,13 +30,25 @@ class Settings(BaseSettings):
     ibkr_private_encryption_pem: str = ""
     ibkr_private_signature_pem: str = ""
 
+    # SnapTrade aggregator (official SDK). App-level credentials shared across
+    # all users — get them from https://dashboard.snaptrade.com/. Per-user
+    # userSecret is obtained at connect time and stored encrypted on the
+    # BrokerAccount. Leave blank to disable SnapTrade: the connect endpoints
+    # return a clean 503 instead of failing with an opaque SDK auth error.
+    snaptrade_client_id: str = ""
+    snaptrade_consumer_key: str = ""
+    # When True, SnapTrade pushes order updates to our webhook instead of us
+    # polling (near-instant detection). Requires a publicly reachable webhook
+    # URL configured in the SnapTrade dashboard.
+    snaptrade_webhook_enabled: bool = False
+
     # Redis for fanout work-queue (Streams + Consumer Groups, NOT pub/sub —
     # we need one message per worker, not broadcast). Set REDIS_URL to a
     # full redis:// or rediss:// URL. Leave blank to disable Redis-based
     # fanout entirely; in that case copy_engine.fanout runs the existing
     # in-process ThreadPoolExecutor path (fine for single-pod dev).
     redis_url: str = ""
-    fanout_stream: str = "signalboxx:fanout"     # XADD stream name
+    fanout_stream: str = "optionhaven:fanout"     # XADD stream name
     fanout_group: str = "fanout_workers"          # consumer group
 
     # When True, the FastAPI process also starts fanout workers as
@@ -45,6 +57,12 @@ class Settings(BaseSettings):
     # separate Render service so the worker pool can scale independently
     # of the backend pod's memory budget.
     run_fanout_worker_in_process: bool = True
+
+    # App 2's signature path: route detected trader orders through the
+    # queue-based fast fanout (queue_fanout + pending_copies + async worker
+    # pool) instead of the legacy serial fanout / Redis Streams. Default True.
+    # Set False to fall back to the legacy dispatch (for A/B comparison).
+    use_queue_fanout: bool = True
 
     # Number of worker threads to spawn. Each one runs its own consume_loop
     # against the same Redis Stream Consumer Group, so messages are shared

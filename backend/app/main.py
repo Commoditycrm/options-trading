@@ -6,10 +6,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import (
-    auth, brokers, events, notifications, options, positions, settings, subscribers, trades,
+    admin, auth, brokers, events, notifications, options, positions, settings, subscribers,
+    trades,
 )
 from app.config import get_settings
-from app.services import alpaca_stream, external_trade_poller, fanout_stream, retry_scheduler
+from app.services import (
+    alpaca_stream, external_trade_poller, fanout_stream, listeners, memory_cache,
+    retry_scheduler, subscriber_worker,
+)
 from app.services import events as events_bus
 
 # Python's root logger defaults to WARNING, which silences every log.info()
@@ -67,10 +71,32 @@ def create_app() -> FastAPI:
     app.include_router(options.router)
     app.include_router(positions.router)
     app.include_router(notifications.router)
+    app.include_router(admin.router)
 
     @app.on_event("startup")
     async def _bind_loop() -> None:
-        events_bus.bind_loop(asyncio.get_running_loop())
+        loop = asyncio.get_running_loop()
+        events_bus.bind_loop(loop)
+        # Bind the loop for the Webull/SnapTrade polling listeners too.
+        listeners.bind_loop(loop)
+
+    @app.on_event("startup")
+    async def _start_broker_listeners() -> None:
+        # Spawn Webull + SnapTrade detection listeners for every connected
+        # trader account. (Alpaca is handled by _start_alpaca_streams below.)
+        # Detected orders flow into copy_engine.dispatch_detected_order →
+        # the queue fast path. Best-effort: missing SDKs are skipped.
+        try:
+            await listeners.start_all_listeners()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("uvicorn").exception("failed to start broker listeners")
+
+    @app.on_event("shutdown")
+    async def _stop_broker_listeners() -> None:
+        try:
+            await listeners.stop_all_listeners()
+        except Exception:  # noqa: BLE001
+            pass
 
     @app.on_event("startup")
     async def _start_alpaca_streams() -> None:
@@ -144,6 +170,61 @@ def create_app() -> FastAPI:
             "started retry_scheduler (interval=%ss)",
             retry_scheduler.POLL_INTERVAL_SEC,
         )
+
+    @app.on_event("startup")
+    async def _start_queue_demo_workers() -> None:
+        # Demo queue-based fanout architecture (anitha-queue-demo branch).
+        # Load the subscriber cache into memory, then start a pool of
+        # asyncio workers that drain pending_copies in parallel.
+        # Env var: QUEUE_DEMO_WORKER_COUNT (default 100). Set to 0 to disable.
+        count = int(os.environ.get("QUEUE_DEMO_WORKER_COUNT", "100"))
+        if count <= 0:
+            return
+        try:
+            memory_cache.load_all()
+        except Exception:  # noqa: BLE001
+            logging.getLogger("uvicorn").exception(
+                "memory_cache.load_all failed; queue demo disabled",
+            )
+            return
+        await subscriber_worker.start_workers(count=count)
+
+    @app.get("/api/admin/demo/stats")
+    def demo_stats(parent_order_id: str | None = None) -> dict:
+        # Surfaces the queue-demo timing data for the admin dashboard.
+        # Without parent_order_id: returns the most recent batch.
+        from sqlalchemy import desc, select as _select
+        from app.database import SessionLocal as _S
+        from app.models.pending_copy import PendingCopy as _PC
+        with _S() as db:
+            if parent_order_id is None:
+                latest = db.execute(
+                    _select(_PC.parent_order_id)
+                    .order_by(desc(_PC.queued_at)).limit(1)
+                ).scalar()
+                if latest is None:
+                    return {"parent_order_id": None, "rows": [],
+                            "memory_cache": memory_cache.snapshot_stats()}
+                parent_order_id = str(latest)
+            rows = db.execute(
+                _select(_PC).where(_PC.parent_order_id == parent_order_id)
+                .order_by(_PC.queued_at)
+            ).scalars().all()
+            return {
+                "parent_order_id": parent_order_id,
+                "memory_cache": memory_cache.snapshot_stats(),
+                "worker_heartbeat": subscriber_worker.heartbeat_status(),
+                "rows": [{
+                    "id": str(r.id),
+                    "subscriber_user_id": str(r.subscriber_user_id),
+                    "status": r.status.value,
+                    "queued_at": r.queued_at.isoformat() if r.queued_at else None,
+                    "picked_up_at": r.picked_up_at.isoformat() if r.picked_up_at else None,
+                    "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+                    "queue_to_broker_ms": r.queue_to_broker_ms,
+                    "detail": r.detail,
+                } for r in rows],
+            }
 
     @app.get("/api/health")
     def health() -> dict:
