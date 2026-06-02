@@ -1,0 +1,10 @@
+# Build/runtime artifacts and local cruft — rebuilt inside the image.
+node_modules
+.next
+.git
+.gitignore
+*.md
+
+# Secrets — NEXT_PUBLIC_* come in as build args; server env at runtime.
+.env
+.env.*
