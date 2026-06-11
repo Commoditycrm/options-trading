@@ -45,7 +45,9 @@ class FillOut(BaseModel):
 class OrderOut(BaseModel):
     id: uuid.UUID
     parent_order_id: uuid.UUID | None
-    broker_account_id: uuid.UUID
+    # NULL when the broker account was disconnected after this order was
+    # placed (FK is SET NULL so history survives the disconnect).
+    broker_account_id: uuid.UUID | None
     instrument_type: InstrumentType
     symbol: str
     side: OrderSide

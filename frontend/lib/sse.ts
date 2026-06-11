@@ -29,7 +29,7 @@ export type AppEvent =
 export interface OrderEventPayload {
   id: string;
   parent_order_id: string | null;
-  broker_account_id: string;
+  broker_account_id: string | null;
   symbol: string;
   side: string;
   order_type: string;

@@ -61,10 +61,13 @@ class Order(Base, TimestampMixin):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    broker_account_id: Mapped[uuid.UUID] = mapped_column(
+    # SET NULL (not CASCADE): disconnecting a broker must NOT erase the user's
+    # trade/P&L history. Orphaned orders keep their data; broker_account_id
+    # just goes NULL. Callers that load the account must handle None.
+    broker_account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("broker_accounts.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("broker_accounts.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
     parent_order_id: Mapped[uuid.UUID | None] = mapped_column(

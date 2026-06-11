@@ -92,7 +92,7 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
                 child.status = OrderStatus.CANCELED
                 child.closed_at = datetime.now(timezone.utc)
                 continue
-            acct = db.get(BrokerAccount, child.broker_account_id)
+            acct = db.get(BrokerAccount, child.broker_account_id) if child.broker_account_id else None
             if acct is None:
                 child.status = OrderStatus.CANCELED
                 child.closed_at = datetime.now(timezone.utc)
@@ -183,7 +183,7 @@ def _submit_to_broker_in_background(
         actor = db.get(User, actor_id)
         if actor is None:
             return
-        acct = db.get(BrokerAccount, order.broker_account_id)
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
         if acct is None:
             # Account was deleted between the request and this background task
             # firing. Mark rejected so the UI doesn't keep the row in "pending".
@@ -350,7 +350,7 @@ def _place_trader_order(
     if is_trader and not copy_engine.trader_can_trade(db, trader):
         raise HTTPException(409, "trading_disabled")
 
-    acct = db.get(BrokerAccount, broker_account_id)
+    acct = db.get(BrokerAccount, broker_account_id) if broker_account_id else None
     if not acct or acct.user_id != trader.id:
         raise HTTPException(404, "broker_account_not_found")
     if acct.connection_status != "connected":
@@ -434,7 +434,7 @@ def cancel_trade(
     ):
         raise HTTPException(409, f"not_cancellable: status is {order.status.value}")
 
-    acct = db.get(BrokerAccount, order.broker_account_id)
+    acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
     if acct is None:
         raise HTTPException(404, "broker_account_missing")
 

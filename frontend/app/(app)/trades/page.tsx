@@ -262,6 +262,61 @@ export default function TradesPage() {
   // Don't early-return — render the table shell immediately so the headers
   // are visible while the data is loading; a spinner row goes inside the body.
 
+  // ── Visible-row computation ────────────────────────────────────────────
+  // Shared by the tab counters AND the table body so the chip counts always
+  // match what's actually rendered. (Previously the chips counted every
+  // order while the body hid filled-and-still-held rows — "All Orders (1)"
+  // over an empty table.)
+  //
+  // An option position is uniquely identified by its contract
+  // (expiry+strike+right), not just the root ticker. Strike comes back as
+  // "200" from the order payload but "200.000" from the parsed OCC on
+  // positions — normalize to a Number string so the two compare cleanly.
+  const normStrike = (s: string | null) => {
+    if (s == null) return "";
+    const n = Number(s);
+    return Number.isFinite(n) ? String(n) : s;
+  };
+  const normExpiry = (s: string | null) => (s ?? "").slice(0, 10);
+  const posKeyOf = (
+    acctId: string,
+    instrument: string,
+    symbol: string,
+    expiry: string | null,
+    strike: string | null,
+    right: string | null,
+  ) =>
+    instrument === "option"
+      ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
+      : `${acctId}:STK:${symbol.toUpperCase()}`;
+  const orderKey = (o: Order) => posKeyOf(
+    o.broker_account_id ?? "", o.instrument_type, o.symbol,
+    o.option_expiry, o.option_strike, o.option_right,
+  );
+
+  const heldKeys = new Set(
+    positions
+      .filter(p => Number(p.quantity) !== 0)
+      .map(p => posKeyOf(
+        p.broker_account_id, p.instrument_type, p.symbol,
+        p.option_expiry, p.option_strike, p.option_right,
+      ))
+  );
+
+  // Filled orders whose position is still open live on the Open Positions
+  // table (Trade Panel / Positions page) — Order History hides them so it
+  // stays a record of completed/cancelled/rejected activity.
+  const isHeldFill = (o: Order) =>
+    !(fromParam || toParam) && o.status === "filled" && heldKeys.has(orderKey(o));
+  // "My Orders" = orders private to the caller: not a mirror copy
+  // (parent_order_id null) and not broadcast to subscribers.
+  const isMineOrder = (o: Order) => !o.parent_order_id && !o.fanned_out_to_subscribers;
+
+  const visibleAll  = orders.filter(o => !isHeldFill(o));
+  const visibleMine = visibleAll.filter(isMineOrder);
+  const visibleOrders = tab === "mine" ? visibleMine : visibleAll;
+  const hiddenHeldCount = orders.length - visibleAll.length;
+
   return (
     // Flex column with full height so the table can claim all leftover vertical
     // space below the (optional) error banner.
@@ -289,12 +344,10 @@ export default function TradesPage() {
       )}
 
       {(() => {
-        // Live counts so each tab can show how many orders it'd surface.
-        // Keep this in sync with the body-side `visibleOrders` filter.
-        const mineCount = orders.filter(
-          o => !o.parent_order_id && !o.fanned_out_to_subscribers
-        ).length;
-        const allCount = orders.length;
+        // Counts come from the same visibleAll/visibleMine arrays the body
+        // renders, so a chip can never claim rows the table doesn't show.
+        const mineCount = visibleMine.length;
+        const allCount = visibleAll.length;
         const Tab = ({ k, label, count }: { k: "mine" | "all"; label: string; count: number }) => {
           const active = tab === k;
           return (
@@ -356,80 +409,27 @@ export default function TradesPage() {
             {!loading && orders.length === 0 && (
               <tr><td colSpan={14} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>No trades yet.</td></tr>
             )}
+            {/* Filled orders whose position is still open are intentionally
+                not listed here — point the user at where they live so an
+                "empty" history is never mistaken for a lost trade. */}
+            {!loading && hiddenHeldCount > 0 && (
+              <tr>
+                <td colSpan={14} className="px-3 py-3 text-center text-xs" style={{ color: "var(--muted)" }}>
+                  {hiddenHeldCount} filled order{hiddenHeldCount === 1 ? "" : "s"} belong{hiddenHeldCount === 1 ? "s" : ""} to
+                  {" "}currently open positions — see{" "}
+                  <Link
+                    href={user?.role === "trader" ? "/trade-panel" : "/positions"}
+                    prefetch={false}
+                    className="underline"
+                    style={{ color: "var(--accent)" }}
+                  >
+                    Open Positions
+                  </Link>
+                  . They&apos;ll appear here once closed.
+                </td>
+              </tr>
+            )}
             {(() => {
-              // Only filled orders whose underlying position is still open
-              // can be "closed". An option position is uniquely identified by
-              // its contract (expiry+strike+right), not just the root ticker —
-              // otherwise closing one AAPL call would still light up Close on
-              // every AAPL row because the user holds AAPL stock.
-              // Strike comes back as "200" from the order payload but "200.000"
-              // from the parsed OCC on positions — normalize to a Number string
-              // ("200") so the two compare cleanly. Same defensive normalize on
-              // expiry just in case the date ever lands as a Date string.
-              const normStrike = (s: string | null) => {
-                if (s == null) return "";
-                const n = Number(s);
-                return Number.isFinite(n) ? String(n) : s;
-              };
-              const normExpiry = (s: string | null) => (s ?? "").slice(0, 10);
-              const posKey = (
-                acctId: string,
-                instrument: string,
-                symbol: string,
-                expiry: string | null,
-                strike: string | null,
-                right: string | null,
-              ) =>
-                instrument === "option"
-                  ? `${acctId}:OPT:${symbol.toUpperCase()}:${normExpiry(expiry)}:${normStrike(strike)}:${right ?? ""}`
-                  : `${acctId}:STK:${symbol.toUpperCase()}`;
-
-              const heldKeys = new Set(
-                positions
-                  .filter(p => Number(p.quantity) !== 0)
-                  .map(p => posKey(
-                    p.broker_account_id,
-                    p.instrument_type,
-                    p.symbol,
-                    p.option_expiry,
-                    p.option_strike,
-                    p.option_right,
-                  ))
-              );
-              // Hide rows that correspond to an open position — those live in
-              // the Open Positions table on the Trade Panel. Order History
-              // should be the historical record of closed/cancelled/rejected
-              // activity, not duplicate the live-position view.
-              const visibleOrders = orders.filter(o => {
-                // Tab filter — "My Orders" = orders that are private to the
-                // caller. For subscribers that means: not a mirror copied
-                // from the trader (parent_order_id is null). For traders that
-                // means: not broadcast to subscribers (fanned_out is false —
-                // e.g. orders placed while copy was paused or with the
-                // "Just me" Exit All scope). "All Orders" shows everything.
-                if (tab === "mine") {
-                  if (o.parent_order_id) return false;
-                  if (o.fanned_out_to_subscribers) return false;
-                }
-
-                // Date-range filter (from Calendar drill-in): the backend
-                // already narrowed by `created_at` via the from/to query
-                // params, so we don't need to re-filter here — just bypass
-                // the "hide if held" rule so opens/closes for the picked
-                // day both surface.
-                if (fromParam || toParam) return true;
-
-                if (o.status !== "filled") return true;     // open / cancelled / rejected — always show
-                return !heldKeys.has(posKey(
-                  o.broker_account_id,
-                  o.instrument_type,
-                  o.symbol,
-                  o.option_expiry,
-                  o.option_strike,
-                  o.option_right,
-                ));
-              });
-
               return visibleOrders.map(o => {
               const isOpen = OPEN_STATUSES.includes(o.status);
               const isFilled = o.status === "filled";

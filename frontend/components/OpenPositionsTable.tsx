@@ -243,7 +243,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
       }>();
       for (const o of orders) {
         if (o.status !== "filled" && o.status !== "partially_filled") continue;
-        const k = key(o.broker_account_id, o.instrument_type, o.symbol, o.option_expiry, o.option_strike, o.option_right);
+        const k = key(o.broker_account_id ?? "", o.instrument_type, o.symbol, o.option_expiry, o.option_strike, o.option_right);
         const lastFillAt = o.fills?.length
           ? o.fills.reduce((a, b) => (a.filled_at > b.filled_at ? a : b)).filled_at
           : (o.status === "filled" ? o.closed_at : null);

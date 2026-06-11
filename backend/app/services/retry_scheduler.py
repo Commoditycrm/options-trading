@@ -196,7 +196,7 @@ def _retry_one_order(order_id: uuid.UUID) -> str:
             return f"gate_failed:{gate_skip}"
 
         # Load broker account + creds
-        acct = db.get(BrokerAccount, child.broker_account_id)
+        acct = db.get(BrokerAccount, child.broker_account_id) if child.broker_account_id else None
         if acct is None:
             child.status = OrderStatus.REJECTED
             child.retry_attempted = True

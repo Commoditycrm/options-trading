@@ -140,7 +140,7 @@ def _build_event(order: Order) -> dict[str, Any]:
         "order": {
             "id": str(order.id),
             "parent_order_id": str(order.parent_order_id) if order.parent_order_id else None,
-            "broker_account_id": str(order.broker_account_id),
+            "broker_account_id": str(order.broker_account_id) if order.broker_account_id else None,
             "symbol": order.symbol,
             "side": order.side.value,
             "order_type": order.order_type.value,

@@ -56,7 +56,9 @@ export interface Fill {
 export interface Order {
   id: string;
   parent_order_id: string | null;
-  broker_account_id: string;
+  /** Null when the broker account was disconnected after this order was
+   *  placed — history survives the disconnect. */
+  broker_account_id: string | null;
   instrument_type: InstrumentType;
   symbol: string;
   side: OrderSide;
