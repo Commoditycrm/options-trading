@@ -27,16 +27,9 @@ def register(payload: RegisterIn, request: Request, db: Session = Depends(get_db
     if existing:
         raise HTTPException(status.HTTP_409_CONFLICT, detail="email_taken")
 
-    if payload.role == UserRole.TRADER:
-        # Product rule: only one trader on the platform.
-        trader_exists = db.execute(
-            select(User).where(User.role == UserRole.TRADER)
-        ).scalar_one_or_none()
-        if trader_exists:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, detail="trader_already_exists"
-            )
-
+    # Multiple traders are allowed: each trader has their own subscribers
+    # (SubscriberSettings.following_trader_id), the fanout cache is keyed by
+    # trader_id, and subscribers pick who to follow via GET /settings/traders.
     user = User(
         email=payload.email,
         password_hash=hash_password(payload.password),
