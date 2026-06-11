@@ -12,7 +12,7 @@ from app.api import (
 from app.config import get_settings
 from app.services import (
     alpaca_stream, external_trade_poller, fanout_stream, listeners, memory_cache,
-    retry_scheduler, subscriber_worker,
+    position_monitor, retry_scheduler, subscriber_worker,
 )
 from app.services import events as events_bus
 
@@ -172,6 +172,19 @@ def create_app() -> FastAPI:
         )
 
     @app.on_event("startup")
+    async def _start_position_monitor() -> None:
+        # Watches open positions that have a stop-loss / take-profit rule and
+        # auto-closes them when the threshold price is crossed. Same poller
+        # model as retry_scheduler (one thread-pool loop); polls only accounts
+        # with an active rule. See services/position_monitor.py.
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, position_monitor.poll_loop)
+        logging.getLogger("uvicorn").info(
+            "started position_monitor (interval=%ss)",
+            position_monitor.POLL_INTERVAL_SEC,
+        )
+
+    @app.on_event("startup")
     async def _start_queue_demo_workers() -> None:
         # Demo queue-based fanout architecture (anitha-queue-demo branch).
         # Load the subscriber cache into memory, then start a pool of
@@ -247,6 +260,7 @@ def create_app() -> FastAPI:
             # is still ticking. "healthy" flips false if the loop hasn't
             # run within 3 poll intervals (~30s default).
             "retry_scheduler": retry_scheduler.heartbeat_status(),
+            "position_monitor": position_monitor.heartbeat_status(),
         }
 
     return app

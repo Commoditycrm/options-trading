@@ -5,6 +5,7 @@ from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.notification import Notification
 from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.pending_copy import PendingCopy, PendingCopyStatus
+from app.models.position_rule import PositionRule, PositionRuleStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 
@@ -23,6 +24,8 @@ __all__ = [
     "OrderType",
     "PendingCopy",
     "PendingCopyStatus",
+    "PositionRule",
+    "PositionRuleStatus",
     "RetryInterval",
     "SubscriberSettings",
     "TraderSettings",

@@ -6,7 +6,7 @@ import { fmtDate, fmtDateTimeMs, fmtDuration } from "@/lib/format";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
-import type { Order, Position } from "@/lib/types";
+import type { Order, Position, PositionRule } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined || n === "") return "—";
@@ -65,6 +65,10 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
     const [closeLimitPrices, setCloseLimitPrices] = useState<Record<string, string>>({});
     // Per-row close size as a percentage of the held quantity. Defaults to 100%.
     const [closePercents, setClosePercents] = useState<Record<string, number>>({});
+    // Active SL/TP rules keyed by posKey, plus per-row editor inputs.
+    const [rules, setRules] = useState<Record<string, PositionRule>>({});
+    const [sltp, setSltp] = useState<Record<string, { sl: string; tp: string }>>({});
+    const [savingSltp, setSavingSltp] = useState<string | null>(null);
     // Filter: default to options since that's the most common workflow here.
     const [filter, setFilter] = useState<"all" | "stock" | "option">("option");
 
@@ -82,18 +86,63 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
 
     const refresh = useCallback(async () => {
       try {
-        const [pos, ords] = await Promise.all([
+        const [pos, ords, ruleList] = await Promise.all([
           api<Position[]>("/api/positions"),
           api<Order[]>("/api/trades").catch(() => [] as Order[]),
+          api<PositionRule[]>("/api/positions/sl-tp").catch(() => [] as PositionRule[]),
         ]);
         setPositions(pos);
         setOrders(ords);
+        const map: Record<string, PositionRule> = {};
+        for (const r of ruleList) {
+          if (r.status === "active") map[`${r.broker_account_id}:${r.broker_symbol}`] = r;
+        }
+        setRules(map);
       } catch (e) {
         notify.fromError(e, "failed to load positions");
       } finally {
         setLoading(false);
       }
     }, []);
+
+    async function saveSltp(p: Position) {
+      const key = posKey(p);
+      const inp = sltp[key] ?? { sl: "", tp: "" };
+      const sl = inp.sl.trim();
+      const tp = inp.tp.trim();
+      if (!sl && !tp) { notify.warn("Enter a stop-loss and/or take-profit price"); return; }
+      const body: Record<string, unknown> = {
+        broker_account_id: p.broker_account_id,
+        broker_symbol: p.broker_symbol,
+      };
+      if (sl) body.stop_loss_price = sl;
+      if (tp) body.take_profit_price = tp;
+      setSavingSltp(key);
+      try {
+        await api("/api/positions/sl-tp", { method: "POST", body: JSON.stringify(body) });
+        notify.success(`SL/TP set on ${p.symbol}`);
+        setSltp(s => ({ ...s, [key]: { sl: "", tp: "" } }));
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "Could not set SL/TP");
+      } finally {
+        setSavingSltp(null);
+      }
+    }
+
+    async function clearSltp(p: Position, rule: PositionRule) {
+      const key = posKey(p);
+      setSavingSltp(key);
+      try {
+        await api(`/api/positions/sl-tp/${rule.id}`, { method: "DELETE" });
+        notify.success(`SL/TP cleared on ${p.symbol}`);
+        refresh();
+      } catch (e) {
+        notify.fromError(e, "Could not clear SL/TP");
+      } finally {
+        setSavingSltp(null);
+      }
+    }
 
     useEffect(() => { refresh(); }, [refresh]);
 
@@ -260,7 +309,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
           <table className="min-w-full text-sm">
             <thead className="sticky top-0 z-10" style={{ background: "var(--panel)" }}>
               <tr>
-                {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Close %", "Actions", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
+                {["Symbol", "Expiry Date", "Type", "Side", "Quantity", "Close %", "Actions", "SL / TP", "Avg entry", "Current price", "Filled price", "Market value", "Unrealized P&L", "Submitted at", "Filled at", "Time Taken to Filled", "Expires in Days"].map(h => (
                   <th key={h} className="text-left px-5 py-3 font-medium whitespace-nowrap" style={{ color: "var(--muted)" }}>{h}</th>
                 ))}
               </tr>
@@ -268,7 +317,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={16} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={17} className="px-3 py-8 text-center" style={{ color: "var(--muted)" }}>
                     <span className="inline-flex items-center gap-2">
                       <Spinner />
                       <span>Loading positions…</span>
@@ -278,7 +327,7 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
               )}
               {!loading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={16} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
+                  <td colSpan={17} className="px-3 py-6 text-center" style={{ color: "var(--muted)" }}>
                     {positions.length === 0
                       ? "No open positions."
                       : filter === "option" ? "No open option positions."
@@ -382,6 +431,59 @@ export const OpenPositionsTable = forwardRef<OpenPositionsTableHandle, { classNa
                             </button>
                           </div>
                         </div>
+                      </td>
+                      {/* SL / TP — set a stop-loss / take-profit; the backend
+                          monitor auto-closes the position when a level is hit. */}
+                      <td className="px-5 py-3">
+                        {(() => {
+                          const rule = rules[key];
+                          const inp = sltp[key] ?? { sl: "", tp: "" };
+                          const busy = savingSltp === key;
+                          return (
+                            <div className="flex flex-col gap-1 whitespace-nowrap">
+                              {rule && (
+                                <div className="flex items-center gap-2 text-[10px]" style={{ color: "var(--text-2)" }}>
+                                  <span>TP {rule.take_profit_price ? fmtNum(rule.take_profit_price, 2) : "—"}</span>
+                                  <span>SL {rule.stop_loss_price ? fmtNum(rule.stop_loss_price, 2) : "—"}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => clearSltp(p, rule)}
+                                    disabled={busy}
+                                    className="underline"
+                                    style={{ color: "var(--bad)" }}
+                                  >
+                                    clear
+                                  </button>
+                                </div>
+                              )}
+                              <div className="flex gap-1 items-center">
+                                <input
+                                  type="number" step="0.01" min="0.01" placeholder="SL"
+                                  value={inp.sl}
+                                  onChange={e => setSltp(s => ({ ...s, [key]: { ...inp, sl: e.target.value } }))}
+                                  className="w-16 px-2 py-1 text-xs border"
+                                  style={{ borderColor: "var(--border)", background: "var(--bg)", borderRadius: "var(--r-sm)" }}
+                                />
+                                <input
+                                  type="number" step="0.01" min="0.01" placeholder="TP"
+                                  value={inp.tp}
+                                  onChange={e => setSltp(s => ({ ...s, [key]: { ...inp, tp: e.target.value } }))}
+                                  className="w-16 px-2 py-1 text-xs border"
+                                  style={{ borderColor: "var(--border)", background: "var(--bg)", borderRadius: "var(--r-sm)" }}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => saveSltp(p)}
+                                  disabled={busy}
+                                  className="btn-ghost px-2 py-1 text-xs inline-flex items-center gap-1"
+                                >
+                                  <span>{rule ? "Update" : "Set"}</span>
+                                  {busy && <Spinner />}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="px-5 py-3 num">{fmtNum(p.avg_entry_price, 2)}</td>
                       <td className="px-5 py-3 num">{fmtNum(p.current_price, 2)}</td>

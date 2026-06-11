@@ -13,6 +13,7 @@ POST /api/positions/{symbol}/close
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from sqlalchemy import select
@@ -24,9 +25,11 @@ from app.brokers import adapter_for
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderType
+from app.models.position_rule import PositionRule, PositionRuleStatus
 from app.models.user import User
 from app.schemas.order import OrderOut, PlaceOrderIn
-from app.schemas.position import ClosePositionIn, PositionOut
+from app.schemas.position import ClosePositionIn, PositionOut, PositionRuleOut, SetSLTPIn
+from app.services import audit
 from app.services.crypto import decrypt_json
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
@@ -223,3 +226,123 @@ def close_position(
         db, user, new_payload, acct.id, background, request,
         is_closing=True,
     )
+
+
+# ─── Position-level stop-loss / take-profit ──────────────────────────────────
+
+@router.get("/sl-tp", response_model=list[PositionRuleOut])
+def list_sl_tp(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[PositionRule]:
+    """List the caller's stop-loss / take-profit rules (active + triggered)."""
+    return list(db.execute(
+        select(PositionRule).where(
+            PositionRule.user_id == user.id,
+            PositionRule.status != PositionRuleStatus.CANCELLED,
+        ).order_by(PositionRule.created_at.desc())
+    ).scalars())
+
+
+@router.post("/sl-tp", response_model=PositionRuleOut)
+def set_sl_tp(
+    payload: SetSLTPIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> PositionRule:
+    """Set (upsert) a stop-loss / take-profit rule on one open position the
+    caller owns. The position_monitor poller auto-closes the position when a
+    threshold price is crossed. Percentage inputs are resolved to prices using
+    the position's live entry price and side."""
+    acct = db.get(BrokerAccount, payload.broker_account_id)
+    if not acct or acct.user_id != user.id:
+        raise HTTPException(404, "broker_account_not_found")
+    if acct.connection_status != "connected":
+        raise HTTPException(409, "broker_not_connected")
+
+    # Validate the position exists and capture entry price + side.
+    creds = decrypt_json(acct.encrypted_credentials)
+    adapter = adapter_for(acct, creds)
+    target = payload.broker_symbol.upper()
+    pos = next(
+        (p for p in adapter.get_positions() if p.broker_symbol.upper() == target),
+        None,
+    )
+    if pos is None or pos.quantity == 0:
+        raise HTTPException(404, "position_not_found")
+
+    entry = pos.avg_entry_price
+    is_long = pos.quantity > 0
+
+    tp = payload.take_profit_price
+    sl = payload.stop_loss_price
+    # Resolve percentage inputs to absolute prices. TP is favourable, SL adverse:
+    # long → TP above / SL below entry; short → TP below / SL above.
+    if tp is None and payload.take_profit_pct is not None:
+        if entry is None:
+            raise HTTPException(422, "entry_price_unavailable_for_pct")
+        tp = entry * (1 + (payload.take_profit_pct / 100) * (1 if is_long else -1))
+    if sl is None and payload.stop_loss_pct is not None:
+        if entry is None:
+            raise HTTPException(422, "entry_price_unavailable_for_pct")
+        sl = entry * (1 - (payload.stop_loss_pct / 100) * (1 if is_long else -1))
+    if tp is not None:
+        tp = tp.quantize(Decimal("0.000001"))
+    if sl is not None:
+        sl = sl.quantize(Decimal("0.000001"))
+
+    existing = db.execute(
+        select(PositionRule).where(
+            PositionRule.broker_account_id == acct.id,
+            PositionRule.broker_symbol == target,
+            PositionRule.status == PositionRuleStatus.ACTIVE,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.take_profit_price = tp
+        existing.stop_loss_price = sl
+        existing.entry_price = entry
+        rule = existing
+    else:
+        rule = PositionRule(
+            user_id=user.id,
+            broker_account_id=acct.id,
+            broker_symbol=target,
+            take_profit_price=tp,
+            stop_loss_price=sl,
+            entry_price=entry,
+            status=PositionRuleStatus.ACTIVE,
+        )
+        db.add(rule)
+    db.flush()
+    audit.record(
+        db, actor_user_id=user.id, action="position.sl_tp_set",
+        entity_type="position_rule", entity_id=rule.id,
+        metadata={
+            "broker_symbol": target,
+            "take_profit_price": str(tp) if tp is not None else None,
+            "stop_loss_price": str(sl) if sl is not None else None,
+        },
+    )
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+@router.delete("/sl-tp/{rule_id}")
+def cancel_sl_tp(
+    rule_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel a stop-loss / take-profit rule the caller owns."""
+    rule = db.get(PositionRule, rule_id)
+    if not rule or rule.user_id != user.id:
+        raise HTTPException(404, "rule_not_found")
+    rule.status = PositionRuleStatus.CANCELLED
+    audit.record(
+        db, actor_user_id=user.id, action="position.sl_tp_cancelled",
+        entity_type="position_rule", entity_id=rule.id,
+    )
+    db.commit()
+    return {"ok": True}

@@ -115,6 +115,21 @@ export interface DailyPnL {
   trade_count: number;
 }
 
+/** A stop-loss / take-profit rule on one open position. The backend
+ *  position_monitor auto-closes the position when a threshold is crossed. */
+export interface PositionRule {
+  id: string;
+  broker_account_id: string;
+  broker_symbol: string;
+  take_profit_price: string | null;
+  stop_loss_price: string | null;
+  entry_price: string | null;
+  status: "active" | "triggered" | "cancelled";
+  triggered_at: string | null;
+  detail: string | null;
+  created_at: string;
+}
+
 export interface SubscriberSettings {
   user_id: string;
   following_trader_id: string | null;

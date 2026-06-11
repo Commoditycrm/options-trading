@@ -1,6 +1,6 @@
 """Schemas for /api/positions — currently held positions at the broker."""
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field, model_validator
@@ -39,3 +39,41 @@ class ClosePositionIn(BaseModel):
         if self.order_type not in (OrderType.MARKET, OrderType.LIMIT):
             raise ValueError("close only supports market or limit")
         return self
+
+
+class SetSLTPIn(BaseModel):
+    """Set (upsert) a stop-loss / take-profit rule on one open position.
+
+    Provide either an absolute price or a percentage of the entry price for
+    each of take-profit and stop-loss. At least one of the two must be set.
+    """
+
+    broker_account_id: uuid.UUID
+    broker_symbol: str = Field(min_length=1, max_length=64)
+    take_profit_price: Decimal | None = Field(default=None, gt=0)
+    stop_loss_price: Decimal | None = Field(default=None, gt=0)
+    take_profit_pct: Decimal | None = Field(default=None, gt=0)
+    stop_loss_pct: Decimal | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _check(self) -> "SetSLTPIn":
+        has_tp = self.take_profit_price is not None or self.take_profit_pct is not None
+        has_sl = self.stop_loss_price is not None or self.stop_loss_pct is not None
+        if not (has_tp or has_sl):
+            raise ValueError("set at least one of take_profit or stop_loss")
+        return self
+
+
+class PositionRuleOut(BaseModel):
+    id: uuid.UUID
+    broker_account_id: uuid.UUID
+    broker_symbol: str
+    take_profit_price: Decimal | None
+    stop_loss_price: Decimal | None
+    entry_price: Decimal | None
+    status: str
+    triggered_at: datetime | None
+    detail: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
