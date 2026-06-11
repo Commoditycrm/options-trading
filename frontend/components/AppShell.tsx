@@ -173,6 +173,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }
     api<User>("/api/auth/me")
       .then((u) => {
+        // Admins don't belong in the trader/subscriber app shell — they have
+        // no settings/broker/positions rows, so every role-gated page here
+        // 403s. Bounce them to their own panel (also covers typing /settings
+        // directly).
+        if (u.role === "admin") { router.replace("/admin"); return; }
         setUser(u);
         try { sessionStorage.setItem(USER_CACHE_KEY, JSON.stringify(u)); } catch {}
         if (u.role === "trader") {
