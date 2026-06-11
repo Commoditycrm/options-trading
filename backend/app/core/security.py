@@ -37,6 +37,18 @@ def create_refresh_token(subject: str) -> str:
     return _encode({"sub": subject, "type": "refresh"}, timedelta(days=s.jwt_refresh_token_days))
 
 
+# Password-reset tokens reuse the same HS256 signing — short-lived and stamped
+# with type="password_reset" so they can't be used as access/refresh tokens.
+RESET_TOKEN_MINUTES = 30
+
+
+def create_reset_token(subject: str) -> str:
+    return _encode(
+        {"sub": subject, "type": "password_reset"},
+        timedelta(minutes=RESET_TOKEN_MINUTES),
+    )
+
+
 def decode_token(token: str) -> dict[str, Any]:
     s = get_settings()
     try:

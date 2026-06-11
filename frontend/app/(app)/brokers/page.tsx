@@ -4,7 +4,8 @@ import { FormEvent, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
-import type { BrokerAccount } from "@/lib/types";
+import { brokerLabel } from "@/lib/format";
+import type { BrokerAccount, Role, User } from "@/lib/types";
 
 function statusColor(s: BrokerAccount["connection_status"]): string {
   return s === "connected" ? "var(--good)" : s === "error" ? "var(--bad)" : "var(--muted)";
@@ -36,6 +37,10 @@ function fmtRelative(iso: string | null): string {
 
 export default function BrokersPage() {
   const [accounts, setAccounts] = useState<BrokerAccount[]>([]);
+  // Subscribers see a broker-agnostic UI ("Brokerage"); traders/admins see
+  // the real broker names. Role drives the white-label.
+  const [role, setRole] = useState<Role | null>(null);
+  const isSubscriber = role === "subscriber";
   // Which form to render (only one broker form at a time).
   const [brokerType, setBrokerType] = useState<"alpaca" | "ibkr">("alpaca");
 
@@ -58,7 +63,10 @@ export default function BrokersPage() {
   async function load() {
     setAccounts(await api<BrokerAccount[]>("/api/brokers"));
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    api<User>("/api/auth/me").then(u => setRole(u.role)).catch(() => {});
+  }, []);
 
   async function connect(e: FormEvent) {
     e.preventDefault();
@@ -138,11 +146,20 @@ export default function BrokersPage() {
       <h1 className="text-2xl font-semibold">Broker connections</h1>
 
       <p className="text-sm" style={{ color: "var(--muted)" }}>
-        Currently supported: <strong>Alpaca</strong> (production-ready) and{" "}
-        <strong>IBKR</strong> (pending validation against a real IBKR account — your
-        connect attempt will return 501 until your operator finishes IBKR's
-        third-party onboarding and sets the consumer-key env vars on the backend).
-        Keys never leave the server — they're encrypted at rest with Fernet (AES-128).
+        {isSubscriber ? (
+          <>
+            Connect your brokerage to start mirroring trades. Your keys never
+            leave the server — they&apos;re encrypted at rest with Fernet (AES-128).
+          </>
+        ) : (
+          <>
+            Currently supported: <strong>Alpaca</strong> (production-ready) and{" "}
+            <strong>IBKR</strong> (pending validation against a real IBKR account — your
+            connect attempt will return 501 until your operator finishes IBKR&apos;s
+            third-party onboarding and sets the consumer-key env vars on the backend).
+            Keys never leave the server — they&apos;re encrypted at rest with Fernet (AES-128).
+          </>
+        )}
       </p>
 
       <section className="space-y-3">
@@ -156,7 +173,7 @@ export default function BrokersPage() {
                   <div className="font-medium">
                     {a.label}
                     <span className="text-xs uppercase ml-2 tracking-wider" style={{ color: "var(--muted)" }}>
-                      {a.broker}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
+                      {brokerLabel(a.broker, role)}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
                     </span>
                   </div>
                   <div className="text-xs mt-1" style={{ color: statusColor(a.connection_status) }}>
@@ -219,16 +236,19 @@ export default function BrokersPage() {
       {/* Broker selector — shown above whichever connect form is active. */}
       <section className="space-y-3">
         <div className="flex gap-2">
-          {(["alpaca", "ibkr"] as const).map((b) => {
+          {/* Subscribers get a broker-agnostic single option; traders/admins
+              see the real broker choices. IBKR is hidden from subscribers. */}
+          {(isSubscriber ? (["alpaca"] as const) : (["alpaca", "ibkr"] as const)).map((b) => {
             const active = brokerType === b;
             const alreadyConnected = accounts.some(a => a.broker === b);
+            const display = brokerLabel(b, role);
             return (
               <button
                 key={b}
                 type="button"
                 onClick={() => setBrokerType(b)}
                 disabled={alreadyConnected}
-                title={alreadyConnected ? `${b.toUpperCase()} is already connected` : undefined}
+                title={alreadyConnected ? `${display} is already connected` : undefined}
                 className="px-4 py-2 text-sm font-medium rounded transition-colors"
                 style={{
                   border: `1px solid ${active ? "rgba(10,115,168,0.4)" : "var(--border)"}`,
@@ -238,7 +258,7 @@ export default function BrokersPage() {
                   cursor: alreadyConnected ? "not-allowed" : "pointer",
                 }}
               >
-                {b === "alpaca" ? "Alpaca" : "Interactive Brokers"}
+                {display}
                 {alreadyConnected && " ✓"}
               </button>
             );
@@ -248,7 +268,7 @@ export default function BrokersPage() {
 
       {brokerType === "alpaca" && !accounts.some(a => a.broker === "alpaca") && (
       <section className="card p-5 space-y-4 max-w-lg">
-        <h2 className="font-semibold">Connect an Alpaca account</h2>
+        <h2 className="font-semibold">{isSubscriber ? "Connect your brokerage" : "Connect an Alpaca account"}</h2>
         <p className="text-xs" style={{ color: "var(--muted)" }}>
           From <a href="https://app.alpaca.markets" target="_blank" rel="noreferrer" className="underline" style={{ color: "var(--accent)" }}>app.alpaca.markets</a>:
           {" "}select Paper Trading → click your name → API Keys → Generate.

@@ -6,9 +6,11 @@ import Link from "next/link";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { useBusinessName } from "@/lib/branding";
 
 export default function LoginPage() {
   const router = useRouter();
+  const businessName = useBusinessName();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -40,13 +42,13 @@ export default function LoginPage() {
         <div className="flex items-center gap-3">
           <img
             src="/brand-icon.avif"
-            alt="The Option Haven"
+            alt={businessName}
             width={45}
             height={45}
             style={{ width: 45, height: 45, borderRadius: 8, objectFit: "cover" }}
           />
           <div>
-            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>The Option Haven</div>
+            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>{businessName}</div>
             <div className="text-xs" style={{ color: "var(--muted)" }}>Sign in to your account</div>
           </div>
         </div>
@@ -81,6 +83,12 @@ export default function LoginPage() {
           <span>Sign in</span>
           {loading && <Spinner />}
         </button>
+
+        <div className="text-center text-sm">
+          <Link href="/forgot-password" className="underline" style={{ color: "var(--muted)" }}>
+            Forgot password?
+          </Link>
+        </div>
 
         <div className="text-center text-sm" style={{ color: "var(--muted)" }}>
           New here? <Link href="/register" className="underline" style={{ color: "var(--accent)" }}>Create an account</Link>

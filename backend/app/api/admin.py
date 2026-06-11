@@ -82,6 +82,10 @@ class CleanupIn(BaseModel):
     trader_email: Optional[str] = None
 
 
+class ConfigIn(BaseModel):
+    business_name: str = Field(min_length=1, max_length=120)
+
+
 # ─── Stats ────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
@@ -116,6 +120,36 @@ def get_stats(
         "trades_today":  trades_today,
         "fake_test_subs": fake_subs,
     }
+
+
+# ─── White-label config (business name) ──────────────────────────────────────
+
+@router.get("/config")
+def get_config(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.models.app_config import AppConfig
+    cfg = db.get(AppConfig, 1)
+    return {"business_name": cfg.business_name if cfg else "The Option Haven"}
+
+
+@router.patch("/config")
+def update_config(
+    payload: ConfigIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> dict:
+    from app.models.app_config import AppConfig
+    cfg = db.get(AppConfig, 1)
+    if cfg is None:
+        cfg = AppConfig(id=1, business_name=payload.business_name)
+        db.add(cfg)
+    else:
+        cfg.business_name = payload.business_name
+    db.commit()
+    log.info("admin set business_name=%r", payload.business_name)
+    return {"ok": True, "business_name": payload.business_name}
 
 
 # ─── User management ──────────────────────────────────────────────────────────

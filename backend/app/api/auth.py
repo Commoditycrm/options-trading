@@ -1,13 +1,15 @@
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, current_user
+from app.config import get_settings
 from app.core.security import (
     create_access_token,
     create_refresh_token,
+    create_reset_token,
     decode_token,
     hash_password,
     verify_password,
@@ -15,8 +17,17 @@ from app.core.security import (
 from app.database import get_db
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
-from app.schemas.auth import LoginIn, RegisterIn, TokenPair, UserOut
+from app.schemas.auth import (
+    ForgotPasswordIn,
+    LoginIn,
+    MessageOut,
+    RegisterIn,
+    ResetPasswordIn,
+    TokenPair,
+    UserOut,
+)
 from app.services import audit
+from app.services.email import send_password_reset_email
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -115,3 +126,69 @@ def refresh(refresh_token: str, db: Session = Depends(get_db)) -> TokenPair:
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(current_user)) -> User:
     return user
+
+
+# ─── Password reset ───────────────────────────────────────────────────────────
+
+_GENERIC_RESET_MESSAGE = (
+    "If an account exists for that email, a reset link has been sent."
+)
+
+
+@router.post("/forgot-password", response_model=MessageOut)
+def forgot_password(
+    payload: ForgotPasswordIn,
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Email a password-reset link. Always returns the same generic message so
+    the response never reveals whether an email is registered (no enumeration).
+    The email send is deferred to a background task — keeps the response fast
+    and timing-independent of whether the user exists."""
+    user = db.execute(
+        select(User).where(User.email == payload.email)
+    ).scalar_one_or_none()
+
+    if user is not None and user.is_active:
+        token = create_reset_token(str(user.id))
+        link = f"{get_settings().frontend_base_url}/reset-password?token={token}"
+        background.add_task(send_password_reset_email, user.email, link)
+        audit.record(
+            db, actor_user_id=user.id, action="user.password_reset_requested",
+            ip_address=client_ip(request),
+        )
+        db.commit()
+
+    return MessageOut(message=_GENERIC_RESET_MESSAGE)
+
+
+@router.post("/reset-password", response_model=MessageOut)
+def reset_password(
+    payload: ResetPasswordIn,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    """Consume a reset token and set a new password."""
+    try:
+        claims = decode_token(payload.token)
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+    if claims.get("type") != "password_reset":
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+
+    import uuid as _uuid
+    try:
+        user = db.get(User, _uuid.UUID(claims["sub"]))
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+    if user is None or not user.is_active:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="invalid_or_expired_token")
+
+    user.password_hash = hash_password(payload.password)
+    audit.record(
+        db, actor_user_id=user.id, action="user.password_reset_completed",
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return MessageOut(message="Password updated. You can now sign in.")

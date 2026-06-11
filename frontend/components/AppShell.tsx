@@ -6,6 +6,7 @@ import { api, ApiError, clearTokens, getAccessToken } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
+import { useBusinessName } from "@/lib/branding";
 import type { SubscriberSettings, User } from "@/lib/types";
 
 function IconBell() {
@@ -123,7 +124,7 @@ function LogoMark({ size = 40 }: { size?: number }) {
   return (
     <img
       src="/brand-icon.avif"
-      alt="The Option Haven"
+      alt=""
       width={size}
       height={size}
       style={{ width: size, height: size, borderRadius: 8, objectFit: "cover" }}
@@ -141,6 +142,7 @@ function initials(s: string | null | undefined, fallback: string) {
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
+  const businessName = useBusinessName();
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
   // Trader-only master switch for copying to subscribers. `null` while
@@ -281,7 +283,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <div className="flex items-center gap-3 px-5 pt-6 pb-7">
           <LogoMark />
           <div className="leading-tight">
-            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>The Option Haven</div>
+            <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>{businessName}</div>
           </div>
         </div>
 

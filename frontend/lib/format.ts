@@ -5,6 +5,30 @@
  * Format target: "May 15, 2026, 01:30:00 AM" for full timestamps,
  *                "May 15, 2026"               for date-only fields.
  */
+import type { BrokerName, Role } from "./types";
+
+const BROKER_DISPLAY: Record<BrokerName, string> = {
+  alpaca: "Alpaca",
+  ibkr: "Interactive Brokers",
+  webull: "Webull",
+  snaptrade: "SnapTrade",
+  mock: "Mock",
+};
+
+/** Canonical broker display name (trader/admin facing). */
+export function brokerName(broker: BrokerName): string {
+  return BROKER_DISPLAY[broker] ?? broker;
+}
+
+/** Role-aware broker label. Subscribers see a generic "Brokerage" so the
+ *  platform stays broker-agnostic to them; traders/admins see the real name.
+ *  Single source of truth for the subscriber white-label rule. */
+export function brokerLabel(
+  broker: BrokerName,
+  role: Role | null | undefined,
+): string {
+  return role === "subscriber" ? "Brokerage" : brokerName(broker);
+}
 
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = {
   month: "short",

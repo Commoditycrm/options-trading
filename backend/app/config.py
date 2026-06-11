@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     # Postgres connection pool contention become the bottleneck).
     fanout_worker_count: int = 8
 
+    # ── SMTP for transactional email (password reset). Leave smtp_host blank
+    # to disable real sending — the email service then logs the reset link
+    # instead (dev/staging fallback so the flow is testable without a relay).
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    email_from: str = "no-reply@optionhaven.app"
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(self.smtp_host)
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

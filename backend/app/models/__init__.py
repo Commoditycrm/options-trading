@@ -1,3 +1,4 @@
+from app.models.app_config import AppConfig
 from app.models.audit_log import AuditLog
 from app.models.base import Base
 from app.models.broker_account import BrokerAccount, BrokerName
@@ -8,6 +9,7 @@ from app.models.settings import RetryInterval, SubscriberSettings, TraderSetting
 from app.models.user import User, UserRole
 
 __all__ = [
+    "AppConfig",
     "AuditLog",
     "Base",
     "BrokerAccount",

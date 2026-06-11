@@ -6,10 +6,12 @@ import { useRouter } from "next/navigation";
 import { api, setTokens } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
+import { useBusinessName } from "@/lib/branding";
 import type { Role } from "@/lib/types";
 
 export default function RegisterPage() {
   const router = useRouter();
+  const businessName = useBusinessName();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState<Role>("subscriber");
@@ -45,13 +47,13 @@ export default function RegisterPage() {
         <div className="flex items-center gap-3">
           <img
             src="/brand-icon.avif"
-            alt="The Option Haven"
+            alt={businessName}
             width={45}
             height={45}
             style={{ width: 45, height: 45, borderRadius: 8, objectFit: "cover" }}
           />
           <div>
-            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>The Option Haven</div>
+            <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: "0.02em" }}>{businessName}</div>
             <div className="text-xs" style={{ color: "var(--muted)" }}>Create an account</div>
           </div>
         </div>

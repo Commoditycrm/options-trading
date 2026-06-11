@@ -226,6 +226,18 @@ def create_app() -> FastAPI:
                 } for r in rows],
             }
 
+    @app.get("/api/config")
+    def public_config() -> dict:
+        # PUBLIC (unauthenticated) white-label config for the frontend. The
+        # login/register pages render the brand name before the user has a
+        # token, so this must not require auth. Falls back to the default if
+        # the single config row is somehow missing.
+        from app.database import SessionLocal as _S
+        from app.models.app_config import AppConfig as _AC
+        with _S() as db:
+            cfg = db.get(_AC, 1)
+            return {"business_name": cfg.business_name if cfg else "The Option Haven"}
+
     @app.get("/api/health")
     def health() -> dict:
         return {
