@@ -53,12 +53,17 @@ def _fake_email(index: int) -> str:
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class UserOut(BaseModel):
-    id: str
+    # id/created_at are typed as their native ORM types (UUID / datetime), not
+    # str: Pydantic v2 will not coerce a UUID or datetime into a `str` field and
+    # raises a ResponseValidationError (HTTP 500) the moment any real user is
+    # serialized. As UUID/datetime they validate from the ORM object and still
+    # serialize to JSON strings, so the frontend contract is unchanged.
+    id: uuid.UUID
     email: str
     role: str
     display_name: Optional[str]
     is_active: bool
-    created_at: str
+    created_at: datetime
 
     model_config = {"from_attributes": True}
 
