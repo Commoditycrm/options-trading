@@ -261,6 +261,7 @@ def create_app() -> FastAPI:
             # run within 3 poll intervals (~30s default).
             "retry_scheduler": retry_scheduler.heartbeat_status(),
             "position_monitor": position_monitor.heartbeat_status(),
+            "external_trade_poller": external_trade_poller.heartbeat_status(),
         }
 
     return app

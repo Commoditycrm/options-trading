@@ -65,6 +65,24 @@ log = logging.getLogger(__name__)
 POLL_INTERVAL_SEC = 2
 ORDERS_PER_POLL = 20
 
+_LAST_HEARTBEAT: dict[str, Any] = {"at": None, "accounts": 0}
+
+
+def heartbeat_status() -> dict[str, Any]:
+    """Exposed via /api/health so operators can confirm external-trade
+    detection is actually polling (and how many accounts it watches)."""
+    last = _LAST_HEARTBEAT.get("at")
+    if last is None:
+        return {"running": False, "last_run_at": None}
+    delta = (datetime.now(timezone.utc) - last).total_seconds()
+    return {
+        "running": True,
+        "last_run_at": last.isoformat(),
+        "seconds_since": round(delta, 1),
+        "accounts_polled": _LAST_HEARTBEAT.get("accounts", 0),
+        "healthy": delta < POLL_INTERVAL_SEC * 5,
+    }
+
 
 # ── helpers (parallel to alpaca_stream.py) ──────────────────────────────────
 
@@ -110,6 +128,7 @@ def _handle_external_order(
     owner: User,
     raw_order: Any,
     broker_oid: str,
+    do_fanout: bool,
 ) -> Order | None:
     """Mirror of alpaca_stream._maybe_handle_external_order — but called
     from a sync poll loop rather than an async WebSocket handler. Same
@@ -185,7 +204,7 @@ def _handle_external_order(
         # TimestampMixin to the moment we INSERT, which is essentially
         # the moment we detected the trade.
         submitted_at=submitted_dt,
-        fanned_out_to_subscribers=True,
+        fanned_out_to_subscribers=do_fanout,
     )
     db.add(order)
     db.flush()
@@ -203,15 +222,17 @@ def _handle_external_order(
         },
     )
 
-    # Dispatch via the unified entrypoint — queue-based fast path by default,
-    # with Redis-Streams / in-process serial as legacy fallbacks.
-    from app.services.copy_engine import dispatch_detected_order
-    result = dispatch_detected_order(db, order, owner)
-    audit.record(
-        db, actor_user_id=owner.id, action="trader.fanout_dispatched",
-        entity_type="order", entity_id=order.id,
-        metadata={"source": "rest_poller_external", **result},
-    )
+    # Only fan out to subscribers when the trader opted in. Otherwise the
+    # order is still recorded (above) so it shows in the trader's own history.
+    if do_fanout:
+        order.fanout_published_at = datetime.now(timezone.utc)
+        from app.services.copy_engine import dispatch_detected_order
+        result = dispatch_detected_order(db, order, owner)
+        audit.record(
+            db, actor_user_id=owner.id, action="trader.fanout_dispatched",
+            entity_type="order", entity_id=order.id,
+            metadata={"source": "rest_poller_external", **result},
+        )
     db.commit()
 
     return order
@@ -236,10 +257,9 @@ def _poll_one_account(account_id: uuid.UUID) -> int:
         if owner is None or owner.role != UserRole.TRADER:
             return 0
         ts = db.get(TraderSettings, owner.id)
-        if ts is None or not ts.mirror_external_trades:
-            return 0
-        if not ts.trading_enabled:
-            return 0
+        # Record the external order for the trader's own visibility regardless;
+        # only FAN OUT to subscribers when they opted in and trading is enabled.
+        do_fanout = bool(ts and ts.mirror_external_trades and ts.trading_enabled)
         creds = decrypt_json(acct.encrypted_credentials)
 
     # Fetch recent orders from Alpaca REST API (outside the DB session
@@ -289,7 +309,7 @@ def _poll_one_account(account_id: uuid.UUID) -> int:
 
             # Genuinely external — handle it
             try:
-                order = _handle_external_order(db, acct, owner, raw_order, broker_oid)
+                order = _handle_external_order(db, acct, owner, raw_order, broker_oid, do_fanout)
                 if order is not None:
                     processed += 1
 
@@ -350,16 +370,22 @@ def poll_loop(shutdown_check=None) -> None:
             # Pick up the set of trader accounts to poll fresh on every iteration
             # so newly-connected brokers join the loop without a restart.
             with SessionLocal() as db:
+                # Poll EVERY connected trader Alpaca account. External orders
+                # are recorded for the trader's own visibility regardless of
+                # settings; fan-out is separately gated on mirror_external_trades
+                # inside _poll_one_account. (Join to TraderSettings limits this
+                # to traders — subscribers have no TraderSettings row.)
                 account_ids = list(db.execute(
                     select(BrokerAccount.id).join(
                         TraderSettings, TraderSettings.user_id == BrokerAccount.user_id,
                     ).where(
                         BrokerAccount.broker == BrokerName.ALPACA,
                         BrokerAccount.connection_status == "connected",
-                        TraderSettings.mirror_external_trades.is_(True),
-                        TraderSettings.trading_enabled.is_(True),
                     )
                 ).scalars())
+
+            _LAST_HEARTBEAT["at"] = datetime.now(timezone.utc)
+            _LAST_HEARTBEAT["accounts"] = len(account_ids)
 
             for account_id in account_ids:
                 try:

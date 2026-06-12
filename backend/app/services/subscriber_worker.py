@@ -53,7 +53,13 @@ from decimal import Decimal as _D
 log = logging.getLogger(__name__)
 
 DEFAULT_WORKER_COUNT = 100
-POLL_IDLE_SLEEP_MS = 25
+# Idle poll interval. Each idle worker runs a SKIP-LOCKED claim query every
+# tick; on a small box, dozens of workers at 25ms hammered the DB pool
+# (~thousands of no-op round-trips/sec with pool_pre_ping) and starved real
+# work — inflating fan-out platform latency. 100ms keeps pickup snappy while
+# cutting idle DB load ~4x. (A LISTEN/NOTIFY wake-up would remove polling
+# entirely — a future improvement.)
+POLL_IDLE_SLEEP_MS = 100
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:

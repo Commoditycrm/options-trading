@@ -56,7 +56,10 @@ services:
       CORS_ORIGINS: ${PUBLIC_URL}
       FRONTEND_BASE_URL: ${PUBLIC_URL}
       # In-process queue worker pool. No Redis on this stack.
-      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-50}
+      # 16 workers is plenty for this box's scale; 50 idle workers polling the
+      # DB starved the small Lightsail instance and inflated fan-out latency.
+      # Bump on a bigger box (and ideally move to LISTEN/NOTIFY wake-ups).
+      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-16}
       RUN_FANOUT_WORKER_IN_PROCESS: "false"
       LOG_LEVEL: INFO
     depends_on:
