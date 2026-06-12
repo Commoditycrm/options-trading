@@ -15,6 +15,7 @@ from app.models.user import User
 from app.schemas.settings import (
     BulkCopyStateOut,
     BulkCopyToggleIn,
+    RemoveSubscribersIn,
     SubscriberMultiplierIn,
     SubscriberSummary,
 )
@@ -102,6 +103,44 @@ def set_bulk_copy_state(
     )
     db.commit()
     return _bulk_state(db, trader.id)
+
+
+@router.post("/remove")
+def remove_subscribers(
+    payload: RemoveSubscribersIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> dict:
+    """Remove one or more subscribers from following this trader. Each is
+    unfollowed (following_trader_id=null) and has copy turned off. Ids that
+    don't currently follow the caller are skipped (reported in `skipped`)."""
+    from app.services import memory_cache
+
+    removed: list[str] = []
+    skipped: list[str] = []
+    for sid in payload.subscriber_ids:
+        s = db.get(SubscriberSettings, sid)
+        if not s or s.following_trader_id != trader.id:
+            skipped.append(str(sid))
+            continue
+        s.following_trader_id = None
+        s.copy_enabled = False
+        audit.record(
+            db,
+            actor_user_id=trader.id,
+            action="trader.subscriber_removed",
+            entity_type="subscriber_settings",
+            entity_id=sid,
+            metadata={"subscriber_id": str(sid)},
+            ip_address=client_ip(request),
+        )
+        removed.append(str(sid))
+    db.commit()
+    for sid in removed:
+        memory_cache.invalidate_subscriber(uuid.UUID(sid))
+    return {"removed": removed, "skipped": skipped,
+            "removed_count": len(removed), "skipped_count": len(skipped)}
 
 
 @router.patch("/{subscriber_id}/multiplier")

@@ -152,6 +152,14 @@ class SubscriberMultiplierIn(BaseModel):
     multiplier: Decimal = Field(gt=0, le=100)
 
 
+class RemoveSubscribersIn(BaseModel):
+    """Trader removes one or more subscribers from following them. Each id must
+    currently follow the caller. Removed subscribers are unfollowed and have
+    copy turned off."""
+
+    subscriber_ids: list[uuid.UUID] = Field(min_length=1)
+
+
 class BulkCopyStateOut(BaseModel):
     """`total`/`enabled` reflect subscribers' own copy flags (informational).
     `paused` is the trader-side master fanout gate — when True, no mirrors
