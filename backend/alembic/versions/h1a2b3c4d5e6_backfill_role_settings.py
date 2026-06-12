@@ -32,7 +32,7 @@ def upgrade() -> None:
             (user_id, trading_enabled, copy_paused, mirror_external_trades, mirror_only_filled)
         SELECT u.id, true, false, false, false
           FROM users u
-         WHERE u.role = 'trader'
+         WHERE u.role = 'TRADER'
            AND NOT EXISTS (
                SELECT 1 FROM trader_settings ts WHERE ts.user_id = u.id
            )
@@ -45,7 +45,7 @@ def upgrade() -> None:
             (user_id, copy_enabled, multiplier, retry_interval_open, retry_interval_close)
         SELECT u.id, false, 1.000, 'never', 'never'
           FROM users u
-         WHERE u.role = 'subscriber'
+         WHERE u.role = 'SUBSCRIBER'
            AND NOT EXISTS (
                SELECT 1 FROM subscriber_settings ss WHERE ss.user_id = u.id
            )
