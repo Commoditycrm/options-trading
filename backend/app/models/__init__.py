@@ -8,6 +8,7 @@ from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.position_rule import PositionRule, PositionRuleStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
+from app.models.watchlist import WatchlistItem
 
 __all__ = [
     "AppConfig",
@@ -31,4 +32,5 @@ __all__ = [
     "TraderSettings",
     "User",
     "UserRole",
+    "WatchlistItem",
 ]

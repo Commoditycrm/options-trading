@@ -199,6 +199,15 @@ export default function TradePanelPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Prefill the underlying from a ?symbol= query param (e.g. clicking a ticker
+  // on the Watchlist). Read from window.location so we don't need a Suspense
+  // boundary around useSearchParams.
+  useEffect(() => {
+    const sym = new URLSearchParams(window.location.search).get("symbol");
+    if (sym) setSymbol(sym.toUpperCase());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Fetch option expiries from SnapTrade when (symbol, account) change.
   // Debounced 500ms so typing "AAPL" doesn't fire 4 requests.
   useEffect(() => {
