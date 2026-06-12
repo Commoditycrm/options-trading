@@ -154,6 +154,46 @@ def _run_cancel_fanout_in_background(trader_order_id: uuid.UUID) -> None:
         db.commit()
 
 
+def _notify_followers_trader_rejected(
+    db: Session, trader_order: Order, reason: str | None,
+) -> None:
+    """The master trader's order was rejected at the broker. Inform every
+    follower so they know the trade didn't go through — but place NO mirror.
+    Blindly copying a reject helps no one; followers get a rejection
+    notification + real-time event, not a (guaranteed-to-fail) order."""
+    from app.services.notifications import create_notification
+
+    follower_ids = list(db.execute(
+        select(SubscriberSettings.user_id).where(
+            SubscriberSettings.following_trader_id == trader_order.user_id
+        )
+    ).scalars())
+    if not follower_ids:
+        return
+
+    trader = db.get(User, trader_order.user_id)
+    trader_name = (trader.display_name or trader.email) if trader else "Your trader"
+    side = trader_order.side.value.upper()
+    qty = str(trader_order.quantity)
+    sym = trader_order.symbol
+    clean = (reason or "rejected by broker")[:160]
+    msg = (
+        f"{trader_name}'s {side} {qty} {sym} order was rejected ({clean}) — "
+        f"no mirror was placed on your account."
+    )
+    for uid in follower_ids:
+        create_notification(
+            db, user_id=uid, type="trader.order_rejected", message=msg,
+            metadata={
+                "trader_id": str(trader_order.user_id),
+                "trader_order_id": str(trader_order.id),
+                "symbol": sym, "side": side, "qty": qty,
+                "reason": (reason or "")[:300],
+            },
+        )
+    db.commit()
+
+
 def _submit_to_broker_in_background(
     order_id: uuid.UUID,
     actor_id: uuid.UUID,
@@ -233,6 +273,9 @@ def _submit_to_broker_in_background(
             db.commit()
             db.refresh(order)
             events.publish(actor.id, copy_engine._order_event("order.updated", order))
+            # Tell followers the master's order was rejected (no mirror placed).
+            if will_fanout:
+                _notify_followers_trader_rejected(db, order, order.reject_reason)
             return
         except Exception as exc:  # noqa: BLE001
             order.status = OrderStatus.REJECTED
@@ -246,6 +289,9 @@ def _submit_to_broker_in_background(
             db.commit()
             db.refresh(order)
             events.publish(actor.id, copy_engine._order_event("order.updated", order))
+            # Tell followers the master's order was rejected (no mirror placed).
+            if will_fanout:
+                _notify_followers_trader_rejected(db, order, order.reject_reason)
             return
 
         order.broker_order_id = result.broker_order_id
