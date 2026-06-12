@@ -504,6 +504,71 @@ def cancel_trade(
     return order
 
 
+@router.post("/trades/cancel-open")
+def cancel_open_orders(
+    request: Request,
+    background: BackgroundTasks,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Cancel every open order the caller owns (best-effort, per order). Same
+    per-order semantics as the single-order cancel: broker cancel, mark
+    CANCELED, and — for a trader's own root orders — cascade the cancel to the
+    subscriber mirrors of that order. Per-order broker failures don't abort the
+    rest; they're reported in `failed`."""
+    open_statuses = (
+        OrderStatus.PENDING, OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+    )
+    orders = list(db.execute(
+        select(Order).where(
+            Order.user_id == user.id,
+            Order.status.in_(open_statuses),
+        )
+    ).scalars())
+
+    cancelled: list[str] = []
+    failed: list[dict] = []
+    cascade_root_ids: list[uuid.UUID] = []
+    now = datetime.now(timezone.utc)
+
+    for order in orders:
+        acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+        if order.broker_order_id and acct is not None:
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter_for(acct, creds).cancel_order(order.broker_order_id)
+            except Exception as exc:  # noqa: BLE001
+                audit.record(
+                    db, actor_user_id=user.id, action="order.cancel_failed",
+                    entity_type="order", entity_id=order.id,
+                    metadata={"error": str(exc)[:480], "path": "cancel_open"},
+                )
+                failed.append({"order_id": str(order.id), "error": str(exc)[:200]})
+                continue
+        order.status = OrderStatus.CANCELED
+        order.closed_at = now
+        audit.record(
+            db, actor_user_id=user.id, action="order.cancelled",
+            entity_type="order", entity_id=order.id,
+            metadata={"broker_order_id": order.broker_order_id, "path": "cancel_open"},
+            ip_address=client_ip(request),
+        )
+        cancelled.append(str(order.id))
+        events.publish(user.id, copy_engine._order_event("order.cancelled", order))
+        if order.parent_order_id is None and user.role == UserRole.TRADER:
+            cascade_root_ids.append(order.id)
+
+    db.commit()
+    # Cascade trader root cancels to their subscriber mirrors (same helper the
+    # single-order cancel uses) so subscribers don't act on a backed-out trade.
+    for root_id in cascade_root_ids:
+        background.add_task(_run_cancel_fanout_in_background, root_id)
+
+    return {"cancelled": cancelled, "failed": failed,
+            "cancelled_count": len(cancelled), "failed_count": len(failed)}
+
+
 @router.post("/trades/{order_id}/close", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 def close_trade(
     order_id: uuid.UUID,
