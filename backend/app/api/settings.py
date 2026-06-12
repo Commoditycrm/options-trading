@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.schemas.settings import (
+    AutoLiquidationLimitIn,
     DailyLossLimitIn,
     DailyLossLimitPctIn,
     DailyProfitLimitPctIn,
@@ -39,6 +40,7 @@ def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
         copy_enabled=s.copy_enabled,
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
+        auto_liquidation_limit=s.auto_liquidation_limit,
         daily_loss_limit_pct=s.daily_loss_limit_pct,
         daily_profit_limit_pct=s.daily_profit_limit_pct,
         per_trade_loss_limit_pct=s.per_trade_loss_limit_pct,
@@ -132,6 +134,40 @@ def set_daily_loss_limit(
         ip_address=client_ip(request),
     )
     db.commit()
+    db.refresh(s)
+    return _sub_out(s, db)
+
+
+@router.patch("/subscriber/auto-liquidation-limit", response_model=SubscriberSettingsOut)
+def set_auto_liquidation_limit(
+    payload: AutoLiquidationLimitIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Req #12: set (or clear) the auto-liquidation equity floor ($). When live
+    account equity falls to/at-or-below this, the position_monitor liquidates
+    all open positions at market and pauses copy until manually re-enabled."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.auto_liquidation_limit
+    s.auto_liquidation_limit = payload.auto_liquidation_limit
+    audit.record(
+        db,
+        actor_user_id=user.id,
+        action="subscriber.auto_liquidation_limit_changed",
+        entity_type="subscriber_settings",
+        entity_id=user.id,
+        metadata={
+            "old": str(old) if old is not None else None,
+            "new": str(payload.auto_liquidation_limit) if payload.auto_liquidation_limit is not None else None,
+        },
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
     db.refresh(s)
     return _sub_out(s, db)
 

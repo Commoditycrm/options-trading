@@ -12,6 +12,8 @@ class SubscriberSettingsOut(BaseModel):
     copy_enabled: bool
     multiplier: Decimal
     daily_loss_limit: Decimal | None
+    # Req #12: auto-liquidation equity floor ($). NULL = disabled.
+    auto_liquidation_limit: Decimal | None = None
     # Percentage-based risk controls (NULL = disabled).
     daily_loss_limit_pct: Decimal | None = None
     daily_profit_limit_pct: Decimal | None = None
@@ -78,6 +80,13 @@ class DailyLossLimitIn(BaseModel):
     """Subscriber-set daily realized-loss kill switch. Pass null to disable."""
 
     daily_loss_limit: Decimal | None = Field(default=None, ge=0)
+
+
+class AutoLiquidationLimitIn(BaseModel):
+    """Req #12: auto-liquidation equity floor in absolute $. When live account
+    equity falls to/at-or-below this, all positions are liquidated at market and
+    copy is paused. Pass null to disable."""
+    auto_liquidation_limit: Decimal | None = Field(default=None, ge=Decimal("0"))
 
 
 class DailyLossLimitPctIn(BaseModel):

@@ -78,6 +78,14 @@ class SubscriberSettings(Base, TimestampMixin):
     # ── Absolute daily-loss kill switch (legacy $) ─────────────────────────
     daily_loss_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
 
+    # ── Req #12: Auto-liquidation equity floor ($) ─────────────────────────
+    # When the account's LIVE equity falls to/at-or-below this $ amount, the
+    # position_monitor liquidates ALL open positions at market and flips
+    # copy_enabled off — a capital-preservation kill switch. NULL = disabled.
+    # Armed only while copy_enabled is True; firing disarms it (copy off) until
+    # the subscriber manually re-enables copy, mirroring the daily-loss pattern.
+    auto_liquidation_limit: Mapped[Decimal | None] = mapped_column(Numeric(20, 2), nullable=True)
+
     # ── Percentage-based risk controls ─────────────────────────────────────
     daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     # Daily PROFIT target as % of account equity. When today's realized P&L

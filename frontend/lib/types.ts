@@ -141,6 +141,9 @@ export interface SubscriberSettings {
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;
+  /** Req #12: auto-liquidation equity floor ($). When live equity falls to/at-
+   *  or-below this, all positions are liquidated and copy pauses. Null = off. */
+  auto_liquidation_limit: string | null;
   /** Daily realized-loss limit as % of equity (null = disabled). */
   daily_loss_limit_pct: string | null;
   /** Daily realized-profit target as % of equity; auto-pauses copy when hit. */

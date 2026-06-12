@@ -24,6 +24,8 @@ export default function SettingsPage() {
   const [multBusy, setMultBusy] = useState(false);
   const [limitInput, setLimitInput] = useState("");
   const [limitBusy, setLimitBusy] = useState(false);
+  const [autoLiqInput, setAutoLiqInput] = useState("");
+  const [autoLiqBusy, setAutoLiqBusy] = useState(false);
   const [lossPctInput, setLossPctInput] = useState("");
   const [lossPctBusy, setLossPctBusy] = useState(false);
   const [profitPctInput, setProfitPctInput] = useState("");
@@ -38,6 +40,7 @@ export default function SettingsPage() {
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
         setLimitInput(s.daily_loss_limit ?? "");
+        setAutoLiqInput(s.auto_liquidation_limit ?? "");
         setLossPctInput(s.daily_loss_limit_pct ?? "");
         setProfitPctInput(s.daily_profit_limit_pct ?? "");
         setTraders(await api("/api/settings/traders"));
@@ -56,9 +59,14 @@ export default function SettingsPage() {
       // Reason-aware message — the same event fires for loss kill-switches,
       // the profit target, drawdown, etc.
       const pnl = e.todays_realized_pnl;
-      const msg = e.reason === "daily_profit_limit"
-        ? `Copy trading auto-paused — today's profit ($${pnl}) hit your daily target. Gains locked in for the day.`
-        : `Copy trading auto-paused — today's realized P&L ($${pnl}) hit your daily limit.`;
+      let msg: string;
+      if (e.reason === "auto_liquidation") {
+        msg = `Auto-liquidation triggered — account equity ($${e.account_equity}) fell to your $${e.auto_liquidation_limit} floor. Closed ${e.positions_closed} position(s). Copy paused until you re-enable it.`;
+      } else if (e.reason === "daily_profit_limit") {
+        msg = `Copy trading auto-paused — today's profit ($${pnl}) hit your daily target. Gains locked in for the day.`;
+      } else {
+        msg = `Copy trading auto-paused — today's realized P&L ($${pnl}) hit your daily limit.`;
+      }
       notify.error(msg, { autoClose: false });   // sticky — requires dismissal
       // Pull fresh settings so the UI's copy toggle now shows OFF.
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
@@ -109,6 +117,28 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update daily loss limit");
     } finally {
       setLimitBusy(false);
+    }
+  }
+  async function saveAutoLiq() {
+    setAutoLiqBusy(true);
+    try {
+      const trimmed = autoLiqInput.trim();
+      const body = { auto_liquidation_limit: trimmed === "" ? null : trimmed };
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/auto-liquidation-limit", {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      });
+      setSub(s);
+      setAutoLiqInput(s.auto_liquidation_limit ?? "");
+      notify.success(
+        s.auto_liquidation_limit
+          ? `Auto-liquidation floor set to $${s.auto_liquidation_limit}`
+          : "Auto-liquidation floor cleared",
+      );
+    } catch (e) {
+      notify.fromError(e, "Could not update auto-liquidation floor");
+    } finally {
+      setAutoLiqBusy(false);
     }
   }
   async function savePctLimit(
@@ -335,6 +365,49 @@ export default function SettingsPage() {
                   className="px-3 py-2 text-sm rounded border"
                   style={{borderColor: "var(--border)", color: "var(--muted)"}}
                   title="Clear the limit (then click Save)"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* Req #12: auto-liquidation equity floor ($) — high-risk kill switch. */}
+          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--danger, #b91c1c)", background: "var(--panel)"}}>
+            <h2 className="font-medium" style={{color: "var(--danger, #ef4444)"}}>Auto-liquidation floor ($)</h2>
+            <p className="text-sm" style={{color: "var(--muted)"}}>
+              A capital-preservation kill switch. When your account&rsquo;s live equity
+              falls to or below this dollar amount, <strong>every open position is
+              liquidated at market</strong> and copy trading is paused until you turn it
+              back on. Checked continuously (~10s) while copy is on. Leave blank to disable.
+            </p>
+            <p className="text-xs" style={{color: "var(--danger, #ef4444)"}}>
+              ⚠ This sells your positions automatically at market. Set it carefully.
+            </p>
+            <div className="flex items-center gap-2">
+              <span style={{color: "var(--muted)"}}>$</span>
+              <input
+                type="number" step="1" min="0"
+                placeholder="(no floor)"
+                className="w-40 p-2 rounded bg-transparent border" style={{borderColor: "var(--border)"}}
+                value={autoLiqInput}
+                onChange={(e) => setAutoLiqInput(e.target.value)}
+              />
+              <button
+                onClick={saveAutoLiq}
+                disabled={autoLiqBusy || autoLiqInput === (sub.auto_liquidation_limit ?? "")}
+                className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
+                style={{background: "var(--accent)", color: "#06121f"}}
+              >
+                <span>Save</span>
+                {autoLiqBusy && <Spinner />}
+              </button>
+              {sub.auto_liquidation_limit !== null && (
+                <button
+                  onClick={() => { setAutoLiqInput(""); }}
+                  className="px-3 py-2 text-sm rounded border"
+                  style={{borderColor: "var(--border)", color: "var(--muted)"}}
+                  title="Clear the floor (then click Save)"
                 >
                   Clear
                 </button>

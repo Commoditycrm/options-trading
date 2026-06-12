@@ -29,7 +29,8 @@ from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.position_rule import PositionRule, PositionRuleStatus
-from app.services import audit, events
+from app.models.settings import SubscriberSettings
+from app.services import audit, events, memory_cache
 from app.services.copy_engine import _order_event
 from app.services.crypto import decrypt_json
 from app.services.notifications import create_notification
@@ -206,6 +207,166 @@ def _check_account(account_id) -> None:
                 db.rollback()
 
 
+# ── Req #12: auto-liquidation equity floor ───────────────────────────────────
+
+def _liquidate_position(db, acct: BrokerAccount, adapter, pos: Any) -> dict:
+    """Place a reverse MARKET order to flatten one position, recording an Order
+    row (is_closing=True). Returns a per-position result dict. Used by the
+    auto-liquidation sweep — like _place_exit but with no PositionRule and no
+    follower cascade (a subscriber's protective liquidation isn't a trade signal)."""
+    reverse_side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+    qty = abs(pos.quantity)
+    order = Order(
+        user_id=acct.user_id,
+        broker_account_id=acct.id,
+        instrument_type=pos.instrument_type,
+        symbol=pos.symbol,
+        option_expiry=pos.option_expiry if pos.instrument_type == InstrumentType.OPTION else None,
+        option_strike=pos.option_strike if pos.instrument_type == InstrumentType.OPTION else None,
+        option_right=pos.option_right if pos.instrument_type == InstrumentType.OPTION else None,
+        side=reverse_side,
+        order_type=OrderType.MARKET,
+        quantity=qty,
+        status=OrderStatus.PENDING,
+        is_closing=True,
+    )
+    db.add(order)
+    db.flush()
+    request = BrokerOrderRequest(
+        instrument_type=order.instrument_type,
+        symbol=order.symbol,
+        side=order.side,
+        order_type=order.order_type,
+        quantity=order.quantity,
+        limit_price=None,
+        stop_price=None,
+        option_expiry=order.option_expiry,
+        option_strike=order.option_strike,
+        option_right=order.option_right,
+        client_order_id=str(order.id),
+    )
+    try:
+        resp = place_order_with_recovery(adapter, request)
+    except Exception as exc:  # noqa: BLE001
+        order.status = OrderStatus.REJECTED
+        order.reject_reason = str(exc)[:480]
+        order.closed_at = datetime.now(timezone.utc)
+        return {"symbol": pos.broker_symbol, "qty": str(qty), "ok": False, "error": str(exc)[:200]}
+    order.status = resp.status
+    order.broker_order_id = resp.broker_order_id
+    order.submitted_at = resp.submitted_at
+    order.filled_quantity = resp.filled_quantity
+    order.filled_avg_price = resp.filled_avg_price
+    return {"symbol": pos.broker_symbol, "qty": str(qty), "ok": True,
+            "order_id": str(order.id), "broker_order_id": resp.broker_order_id}
+
+
+def _check_auto_liquidation(account_id) -> bool:
+    """For one armed subscriber broker account: fetch LIVE equity and, if it has
+    fallen to/at-or-below the subscriber's auto_liquidation_limit, liquidate ALL
+    open positions at market, flip copy_enabled off, and notify. Returns True if
+    a liquidation was triggered (so the SL/TP pass can skip this account).
+
+    Fail-safe: only acts on a successful LIVE balance snapshot. If the adapter
+    can't report live equity (no snapshot capability or a broker error), it logs
+    and skips rather than risk auto-selling on stale cached data."""
+    with SessionLocal() as db:
+        acct = db.get(BrokerAccount, account_id)
+        if acct is None or acct.connection_status != "connected":
+            return False
+        sub = db.get(SubscriberSettings, acct.user_id)
+        # Re-check the arm conditions under a fresh session (the row may have
+        # changed since the poll loop's gather query).
+        if sub is None or sub.auto_liquidation_limit is None or not sub.copy_enabled:
+            return False
+        limit = sub.auto_liquidation_limit
+
+        try:
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter = adapter_for(acct, creds)
+        except Exception:  # noqa: BLE001
+            log.exception("auto_liquidation: adapter build failed for acct=%s", account_id)
+            return False
+
+        # LIVE equity only — never liquidate on stale cached data.
+        if not hasattr(adapter, "get_balance_snapshot"):
+            log.warning("auto_liquidation: %s has no live balance snapshot — skipping acct=%s",
+                        acct.broker.value, account_id)
+            return False
+        try:
+            bal = adapter.get_balance_snapshot()
+        except Exception:  # noqa: BLE001
+            log.exception("auto_liquidation: balance snapshot failed for acct=%s", account_id)
+            return False
+        equity = bal.get("total_equity")
+        if equity is None:
+            log.warning("auto_liquidation: no equity figure for acct=%s — skipping", account_id)
+            return False
+
+        # Opportunistically refresh the cached balance so the % gates + UI stay
+        # fresh (this is the only periodic balance refresh in the system).
+        acct.cash = bal.get("cash")
+        acct.buying_power = bal.get("buying_power")
+        acct.total_equity = equity
+        acct.currency = bal.get("currency")
+        acct.balance_updated_at = datetime.now(timezone.utc)
+
+        if equity > limit:
+            db.commit()  # persist the refreshed balance; floor not breached
+            return False
+
+        # ── BREACH: liquidate everything, pause copy. ──────────────────────
+        try:
+            positions = [p for p in adapter.get_positions() if p.quantity != 0]
+        except Exception:  # noqa: BLE001
+            log.exception("auto_liquidation: get_positions failed for acct=%s", account_id)
+            positions = []
+
+        results = []
+        for pos in positions:
+            try:
+                results.append(_liquidate_position(db, acct, adapter, pos))
+            except Exception as exc:  # noqa: BLE001
+                log.exception("auto_liquidation: liquidate failed for %s on acct=%s",
+                              pos.broker_symbol, account_id)
+                results.append({"symbol": pos.broker_symbol, "ok": False, "error": str(exc)[:200]})
+
+        closed = sum(1 for r in results if r.get("ok"))
+        failed = sum(1 for r in results if not r.get("ok"))
+
+        sub.copy_enabled = False
+        meta = {
+            "auto_liquidation_limit": str(limit),
+            "account_equity": str(equity),
+            "positions_closed": str(closed),
+            "positions_failed": str(failed),
+        }
+        audit.record(
+            db, actor_user_id=acct.user_id, action="copy.auto_liquidated",
+            entity_type="subscriber_settings", entity_id=acct.user_id, metadata=meta,
+        )
+        create_notification(
+            db, user_id=acct.user_id, type="copy.auto_liquidated",
+            message=(
+                f"Auto-liquidation triggered — account equity ${equity} fell to your "
+                f"${limit} floor. Closed {closed} position(s)"
+                + (f" ({failed} failed)" if failed else "")
+                + ". Copy trading is paused until you re-enable it."
+            ),
+            metadata=meta,
+        )
+        db.commit()
+        memory_cache.invalidate_subscriber(acct.user_id)
+        # Reuse the copy.auto_paused channel the settings UI already listens on
+        # so the copy toggle flips to OFF in real time, with reason metadata.
+        events.publish(acct.user_id, {
+            "type": "copy.auto_paused", "reason": "auto_liquidation", **meta,
+        })
+        log.warning("auto_liquidation: FIRED acct=%s equity=%s limit=%s closed=%d failed=%d",
+                    account_id, equity, limit, closed, failed)
+        return True
+
+
 # ── monitor loop ─────────────────────────────────────────────────────────────
 
 _LAST_HEARTBEAT: dict[str, Any] = {"at": None}
@@ -236,12 +397,36 @@ def poll_loop(shutdown_check=None) -> None:
         _LAST_HEARTBEAT["at"] = datetime.now(timezone.utc)
         try:
             with SessionLocal() as db:
-                account_ids = list(db.execute(
+                # Accounts with an active SL/TP rule.
+                rule_account_ids = list(db.execute(
                     select(PositionRule.broker_account_id).where(
                         PositionRule.status == PositionRuleStatus.ACTIVE,
                     ).distinct()
                 ).scalars())
-            for account_id in account_ids:
+                # Req #12: armed subscriber accounts — copy on + a floor set.
+                auto_liq_account_ids = list(db.execute(
+                    select(BrokerAccount.id)
+                    .join(SubscriberSettings, SubscriberSettings.user_id == BrokerAccount.user_id)
+                    .where(
+                        BrokerAccount.connection_status == "connected",
+                        SubscriberSettings.copy_enabled.is_(True),
+                        SubscriberSettings.auto_liquidation_limit.isnot(None),
+                    )
+                ).scalars())
+
+            # Auto-liquidation runs FIRST so a breached account is flattened
+            # before the SL/TP pass would place a now-redundant exit on it.
+            liquidated: set = set()
+            for account_id in auto_liq_account_ids:
+                try:
+                    if _check_auto_liquidation(account_id):
+                        liquidated.add(account_id)
+                except Exception:  # noqa: BLE001
+                    log.exception("position_monitor: auto-liquidation error on acct=%s", account_id)
+
+            for account_id in rule_account_ids:
+                if account_id in liquidated:
+                    continue
                 try:
                     _check_account(account_id)
                 except Exception:  # noqa: BLE001
