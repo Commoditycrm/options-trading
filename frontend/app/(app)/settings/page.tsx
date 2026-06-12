@@ -140,6 +140,19 @@ export default function SettingsPage() {
       setBusy(false);
     }
   }
+  async function toggleFollowExits(next: boolean) {
+    try {
+      const s = await api<SubscriberSettings>("/api/settings/subscriber/follow-trader-exits", {
+        method: "PATCH", body: JSON.stringify({ follow_trader_exits: next }),
+      });
+      setSub(s);
+      notify.success(next
+        ? "You'll mirror the trader's exits (close + SL/TP)."
+        : "You'll manage your own exits — the trader's closes won't be mirrored.");
+    } catch (e) {
+      notify.fromError(e, "Could not update exit-following");
+    }
+  }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
     try {
       const body = direction === "open"
@@ -385,6 +398,32 @@ export default function SettingsPage() {
                   </button>
                 </div>
               </div>
+            </div>
+          </section>
+
+          {/* Follow trader exits — mirror the trader's closes / SL/TP. */}
+          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <h2 className="font-medium">Follow trader exits</h2>
+                <p className="text-sm" style={{color: "var(--muted)"}}>
+                  When ON, the trader&rsquo;s position exits — manual closes and
+                  stop-loss / take-profit triggers — are mirrored to your account.
+                  Turn OFF to manage your own exits.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => toggleFollowExits(!(sub.follow_trader_exits ?? true))}
+                className="px-4 py-2 rounded font-medium shrink-0"
+                style={{
+                  background: (sub.follow_trader_exits ?? true) ? "var(--accent)" : "transparent",
+                  color: (sub.follow_trader_exits ?? true) ? "#06121f" : "var(--text-2)",
+                  border: `1px solid ${(sub.follow_trader_exits ?? true) ? "var(--accent)" : "var(--border)"}`,
+                }}
+              >
+                {(sub.follow_trader_exits ?? true) ? "ON" : "OFF"}
+              </button>
             </div>
           </section>
 

@@ -8,7 +8,7 @@ import { Spinner } from "@/components/Spinner";
 import { OpenPositionsTable, type OpenPositionsTableHandle } from "@/components/OpenPositionsTable";
 import { ExitAllModal } from "@/components/ExitAllModal";
 import { StrikePicker } from "@/components/StrikePicker";
-import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight } from "@/lib/types";
+import type { BrokerAccount, InstrumentType, Order, OrderSide, OrderType, OptionRight, Position } from "@/lib/types";
 
 function fmtNum(n: string | null | undefined, dp = 2): string {
   if (n === null || n === undefined || n === "") return "—";
@@ -152,6 +152,9 @@ export default function TradePanelPage() {
   const [strike, setStrike] = useState("");
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
+  // Optional SL/TP % applied to the resulting position after it fills.
+  const [tpPct, setTpPct] = useState("");
+  const [slPct, setSlPct] = useState("");
   const [last, setLast] = useState<Order | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
@@ -330,6 +333,40 @@ export default function TradePanelPage() {
     return q * px;
   }, [instrument, orderType, qty, limit]);
 
+  /** After an order is placed, poll for the resulting position to appear
+   *  (the order has to fill first) and then attach the SL/TP % rule. The
+   *  backend monitor watches it and, for a trader, cascades the exit to
+   *  followers. Fire-and-forget; gives up after a short window. */
+  async function applySlTpWhenFilled(
+    brokerSymbol: string, accountId: string, tp: string, sl: string,
+  ) {
+    const target = brokerSymbol.toUpperCase();
+    for (let i = 0; i < 10; i++) {
+      await new Promise(r => setTimeout(r, 1200));
+      try {
+        const positions = await api<Position[]>("/api/positions");
+        const pos = positions.find(p =>
+          p.broker_account_id === accountId &&
+          p.broker_symbol.toUpperCase() === target &&
+          Number(p.quantity) !== 0,
+        );
+        if (pos) {
+          const body: Record<string, unknown> = {
+            broker_account_id: accountId,
+            broker_symbol: pos.broker_symbol,
+          };
+          if (tp.trim()) body.take_profit_pct = tp.trim();
+          if (sl.trim()) body.stop_loss_pct = sl.trim();
+          await api("/api/positions/sl-tp", { method: "POST", body: JSON.stringify(body) });
+          notify.success(`SL/TP applied to ${pos.symbol}`);
+          positionsRef.current?.refresh();
+          return;
+        }
+      } catch { /* keep polling */ }
+    }
+    notify.warn("Order placed, but SL/TP wasn't auto-applied (not filled yet) — set it on the open position.");
+  }
+
   /**
    * Single placement path used by:
    *   - Express "Buy/Sell at Market" buttons (overrideSide + overrideType="market")
@@ -382,6 +419,15 @@ export default function TradePanelPage() {
       // SSE-driven refresh handles this too, but call explicitly so the
       // positions row appears even if the user disconnected from the stream.
       positionsRef.current?.refresh();
+      // Optional SL/TP %: once the position fills, attach the rule (the
+      // monitor then cascades the exit to followers for a trader).
+      if (tpPct.trim() || slPct.trim()) {
+        const bsym = instrument === "option" ? occ : symbol.toUpperCase();
+        if (bsym) {
+          void applySlTpWhenFilled(bsym, acctId, tpPct, slPct);
+          setTpPct(""); setSlPct("");
+        }
+      }
     } catch (e) {
       notify.fromError(e, "Order placement failed");
     } finally {
@@ -632,6 +678,28 @@ export default function TradePanelPage() {
               />
             </div>
           )}
+
+          {/* Optional stop-loss / take-profit % — applied to the resulting
+              position once it fills. For a trader, the exit cascades to
+              followers (who can opt out in their settings). */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label hint="optional">Stop loss %</Label>
+              <input
+                type="number" step="0.1" min="0"
+                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
+                placeholder="e.g. 20" value={slPct} onChange={e => setSlPct(e.target.value)}
+              />
+            </div>
+            <div>
+              <Label hint="optional">Take profit %</Label>
+              <input
+                type="number" step="0.1" min="0"
+                className="w-full p-2 rounded bg-transparent border" style={inputStyle}
+                placeholder="e.g. 50" value={tpPct} onChange={e => setTpPct(e.target.value)}
+              />
+            </div>
+          </div>
 
           <button
             type="submit"

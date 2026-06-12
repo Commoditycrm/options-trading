@@ -150,6 +150,8 @@ export interface SubscriberSettings {
   retry_interval_open: RetryInterval;
   retry_interval_close: RetryInterval;
   todays_realized_pnl: string | null;
+  /** Mirror the trader's position exits (manual close + SL/TP cascade). */
+  follow_trader_exits?: boolean;
   /** Mirrors the followed trader's master pause. When true, the subscriber
    *  can't re-enable their own copy until the trader resumes. */
   trader_paused?: boolean;

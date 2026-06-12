@@ -11,6 +11,7 @@ from app.schemas.settings import (
     DailyLossLimitPctIn,
     DailyProfitLimitPctIn,
     ExcludedSymbolsIn,
+    FollowTraderExitsIn,
     FollowTraderIn,
     MaxDrawdownPctIn,
     PerTradeLossLimitPctIn,
@@ -49,6 +50,7 @@ def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
         excluded_symbols=list(s.excluded_symbols or []),
         take_profit_pct=s.take_profit_pct,
         stop_loss_pct=s.stop_loss_pct,
+        follow_trader_exits=s.follow_trader_exits,
     )
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
@@ -270,6 +272,32 @@ def set_daily_profit_limit_pct(
         entity_type="subscriber_settings", entity_id=user.id,
         metadata={"old": str(old) if old is not None else None,
                   "new": str(payload.daily_profit_limit_pct) if payload.daily_profit_limit_pct is not None else None},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
+    db.refresh(s)
+    return _sub_out(s, db)
+
+
+@router.patch("/subscriber/follow-trader-exits", response_model=SubscriberSettingsOut)
+def set_follow_trader_exits(
+    payload: FollowTraderExitsIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Toggle whether the subscriber mirrors the trader's position exits
+    (manual close + SL/TP cascade). Default True."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    s.follow_trader_exits = payload.follow_trader_exits
+    audit.record(
+        db, actor_user_id=user.id, action="subscriber.follow_trader_exits_changed",
+        entity_type="subscriber_settings", entity_id=user.id,
+        metadata={"follow_trader_exits": payload.follow_trader_exits},
         ip_address=client_ip(request),
     )
     db.commit()

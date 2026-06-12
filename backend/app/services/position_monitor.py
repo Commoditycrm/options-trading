@@ -144,6 +144,23 @@ def _place_exit(db, acct: BrokerAccount, adapter, pos: Any, rule: PositionRule, 
     )
     db.commit()
     events.publish(acct.user_id, _order_event("order.updated", order))
+
+    # Cascade the exit to followers: when a TRADER's position SL/TP fires,
+    # fan the close out so every following subscriber mirrors the exit on
+    # their own account (subscriber_worker skips anyone who set
+    # follow_trader_exits=False). Subscribers' own SL/TP closes don't cascade.
+    try:
+        from app.models.user import User, UserRole
+        from app.services.copy_engine import queue_fanout
+        owner = db.get(User, acct.user_id)
+        if owner is not None and owner.role == UserRole.TRADER:
+            queued = queue_fanout(db, order, owner)
+            if queued:
+                log.info("position_monitor: cascaded SL/TP close to %d follower(s) "
+                         "for trader=%s", queued, acct.user_id)
+    except Exception:  # noqa: BLE001
+        log.exception("position_monitor: cascade fanout failed for rule=%s", rule.id)
+
     return "triggered"
 
 

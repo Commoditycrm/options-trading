@@ -109,6 +109,14 @@ class SubscriberSettings(Base, TimestampMixin):
         ARRAY(Text()), nullable=False, default=list, server_default="{}"
     )
 
+    # When True (default), the subscriber mirrors the trader's position
+    # EXITS too — so a trader's manual close or SL/TP-triggered exit closes
+    # the subscriber's mirrored position. False = the subscriber manages
+    # their own exits (via their take_profit_pct/stop_loss_pct or manually).
+    follow_trader_exits: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False,
+    )
+
     # ── Req #4: Auto take-profit / stop-loss (Replace mode) ───────────────
     # When set, the worker places an IBKR OCA bracket around the option entry.
     # Stored as a positive percentage, e.g. 5.000 = 5%. NULL = disabled.

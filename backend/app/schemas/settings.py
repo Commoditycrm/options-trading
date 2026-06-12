@@ -27,6 +27,8 @@ class SubscriberSettingsOut(BaseModel):
     # Req #4: auto TP/SL
     take_profit_pct: Decimal | None = None
     stop_loss_pct: Decimal | None = None
+    # Mirror the trader's position exits (manual close + SL/TP cascade).
+    follow_trader_exits: bool = True
 
     model_config = {"from_attributes": True}
 
@@ -112,6 +114,11 @@ class TakeProfitPctIn(BaseModel):
 class StopLossPctIn(BaseModel):
     """Req #4: auto stop-loss % below entry premium. Null to disable."""
     stop_loss_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class FollowTraderExitsIn(BaseModel):
+    """Whether the subscriber mirrors the trader's position exits."""
+    follow_trader_exits: bool
 
 
 class FollowTraderIn(BaseModel):

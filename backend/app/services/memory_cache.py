@@ -64,6 +64,8 @@ class SubscriberCacheEntry:
     # Req #4: auto take-profit / stop-loss % for bracket orders (NULL = off).
     take_profit_pct: Decimal | None
     stop_loss_pct: Decimal | None
+    # Whether to mirror the trader's position exits (default True).
+    follow_trader_exits: bool
     broker_accounts: tuple[BrokerAccountSnapshot, ...]
 
 
@@ -92,6 +94,7 @@ def _build_entry(db: Session, sub: SubscriberSettings) -> SubscriberCacheEntry:
         excluded_symbols=tuple(s.upper() for s in (sub.excluded_symbols or [])),
         take_profit_pct=sub.take_profit_pct,
         stop_loss_pct=sub.stop_loss_pct,
+        follow_trader_exits=sub.follow_trader_exits,
         broker_accounts=tuple(
             BrokerAccountSnapshot(id=a.id, supports_fractional=a.supports_fractional)
             for a in accounts

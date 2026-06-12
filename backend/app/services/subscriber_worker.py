@@ -223,6 +223,13 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
                             f"excluded_symbol:{trader_order.symbol.upper()}")
             return "excluded_symbol"
 
+        # Subscriber opted out of mirroring the trader's exits — they manage
+        # their own. Skip any CLOSING order fanned out from the trader (manual
+        # close or SL/TP-triggered cascade).
+        if trader_order.is_closing and not entry.follow_trader_exits:
+            _record_outcome(db, pc, PendingCopyStatus.FAILED, "follow_trader_exits_off")
+            return "follow_trader_exits_off"
+
         # ── Req #4 Replace mode: skip if trader is CLOSING a position that
         # this subscriber is managing themselves via TP/SL bracket. ─────────
         if trader_order.is_closing and (entry.take_profit_pct or entry.stop_loss_pct):
