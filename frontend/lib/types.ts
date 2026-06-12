@@ -148,11 +148,19 @@ export interface SubscriberSettings {
   daily_loss_limit_pct: string | null;
   /** Daily realized-profit target as % of equity; auto-pauses copy when hit. */
   daily_profit_limit_pct: string | null;
+  /** Per-trade realized-loss limit as % of equity (null = disabled). */
+  per_trade_loss_limit_pct?: string | null;
+  /** Max drawdown % below the baseline captured when enabled (null = off). */
+  max_drawdown_pct?: string | null;
+  /** Equity baseline captured when max-drawdown was enabled. */
+  max_drawdown_equity_baseline?: string | null;
   /** Retry policy when a mirror order fails with a transient (broker-
    *  disconnect) error. NEVER = REJECT immediately on first failure. */
   retry_interval_open: RetryInterval;
   retry_interval_close: RetryInterval;
   todays_realized_pnl: string | null;
+  /** Current account equity (sum across connected brokers); null if unknown. */
+  account_equity?: string | null;
   /** Mirror the trader's position exits (manual close + SL/TP cascade). */
   follow_trader_exits?: boolean;
   /** Mirrors the followed trader's master pause. When true, the subscriber

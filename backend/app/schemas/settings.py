@@ -24,6 +24,10 @@ class SubscriberSettingsOut(BaseModel):
     retry_interval_open: RetryInterval = RetryInterval.NEVER
     retry_interval_close: RetryInterval = RetryInterval.NEVER
     todays_realized_pnl: Decimal | None = None
+    # Current account equity (sum across connected brokers) — lets the UI render
+    # the $ threshold/headroom for percentage-based risk controls. None if no
+    # connected account has an equity figure yet.
+    account_equity: Decimal | None = None
     # Req #6: exclusion list
     excluded_symbols: list[str] = []
     # Req #4: auto TP/SL

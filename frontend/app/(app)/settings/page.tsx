@@ -245,6 +245,58 @@ export default function SettingsPage() {
   const headroom = limit !== null ? limit + todaysPnL : null;  // todaysPnL is negative when losing
   const limitPct = limit !== null && limit > 0 ? Math.min(100, Math.max(0, (-todaysPnL / limit) * 100)) : 0;
 
+  // Format a raw number as USD.
+  const money = (n: number): string =>
+    Number.isFinite(n) ? n.toLocaleString(undefined, { style: "currency", currency: "USD" }) : "—";
+
+  // ── Risk Controls overview rows (parity with ARK's table: Limit / Threshold
+  // / Today / Headroom / Used). Only configured controls appear; the $ columns
+  // need account equity, so percentage rows show "—" until equity is known. ──
+  type RiskRow = { name: string; limit: string; threshold: string; today: string; headroom: string; used: number | null };
+  const eq = sub?.account_equity != null && sub.account_equity !== "" ? Number(sub.account_equity) : null;
+  const pnl = todaysPnL; // negative when losing today
+  const riskRows: RiskRow[] = [];
+  if (sub) {
+    if (sub.daily_loss_limit) {
+      const lim = Number(sub.daily_loss_limit);
+      riskRows.push({ name: "Daily loss ($)", limit: money(lim), threshold: money(lim), today: money(pnl),
+        headroom: money(Math.max(0, lim + pnl)), used: lim > 0 ? Math.min(100, Math.max(0, (-pnl / lim) * 100)) : null });
+    }
+    if (sub.daily_loss_limit_pct) {
+      const thr = eq != null ? eq * Number(sub.daily_loss_limit_pct) / 100 : null;
+      riskRows.push({ name: "Daily loss (%)", limit: `${sub.daily_loss_limit_pct}%`,
+        threshold: thr != null ? money(thr) : "—", today: money(pnl),
+        headroom: thr != null ? money(Math.max(0, thr + pnl)) : "—",
+        used: thr != null && thr > 0 ? Math.min(100, Math.max(0, (-pnl / thr) * 100)) : null });
+    }
+    if (sub.daily_profit_limit_pct) {
+      const thr = eq != null ? eq * Number(sub.daily_profit_limit_pct) / 100 : null;
+      riskRows.push({ name: "Daily profit (%)", limit: `${sub.daily_profit_limit_pct}%`,
+        threshold: thr != null ? money(thr) : "—", today: money(pnl),
+        headroom: thr != null ? money(Math.max(0, thr - pnl)) : "—",
+        used: thr != null && thr > 0 ? Math.min(100, Math.max(0, (pnl / thr) * 100)) : null });
+    }
+    if (sub.per_trade_loss_limit_pct) {
+      const thr = eq != null ? eq * Number(sub.per_trade_loss_limit_pct) / 100 : null;
+      riskRows.push({ name: "Per-trade loss (%)", limit: `${sub.per_trade_loss_limit_pct}%`,
+        threshold: thr != null ? money(thr) : "—", today: "—", headroom: "—", used: null });
+    }
+    if (sub.max_drawdown_pct && sub.max_drawdown_equity_baseline) {
+      const base = Number(sub.max_drawdown_equity_baseline);
+      const maxDD = base * Number(sub.max_drawdown_pct) / 100;
+      const minEq = base - maxDD;
+      const ddSoFar = eq != null ? base - eq : null;
+      riskRows.push({ name: "Max drawdown (%)", limit: `${sub.max_drawdown_pct}%`, threshold: money(minEq),
+        today: eq != null ? money(eq) : "—", headroom: eq != null ? money(Math.max(0, eq - minEq)) : "—",
+        used: ddSoFar != null && maxDD > 0 ? Math.min(100, Math.max(0, (ddSoFar / maxDD) * 100)) : null });
+    }
+    if (sub.auto_liquidation_limit) {
+      const floor = Number(sub.auto_liquidation_limit);
+      riskRows.push({ name: "Auto-liq floor ($)", limit: money(floor), threshold: money(floor),
+        today: eq != null ? money(eq) : "—", headroom: eq != null ? money(Math.max(0, eq - floor)) : "—", used: null });
+    }
+  }
+
   return (
     <div className="space-y-6 max-w-2xl">
       <h1 className="text-2xl font-semibold">Settings</h1>
@@ -301,6 +353,54 @@ export default function SettingsPage() {
               </span>
             </div>
           </section>
+
+          {/* Risk Controls overview — at-a-glance table of all configured
+              limits with their $ threshold, today's figure, headroom, and used%. */}
+          {riskRows.length > 0 && (
+            <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+              <div className="flex items-center justify-between">
+                <h2 className="font-medium">Risk controls</h2>
+                <span className="text-xs" style={{color: "var(--muted)"}}>
+                  equity {eq != null ? money(eq) : "—"}
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr>
+                      {["Control", "Limit", "Threshold", "Today", "Headroom", "Used"].map(h => (
+                        <th key={h} className="text-left px-2 py-1.5 font-medium text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {riskRows.map(r => (
+                      <tr key={r.name} className="border-t" style={{borderColor: "var(--border)"}}>
+                        <td className="px-2 py-2">{r.name}</td>
+                        <td className="px-2 py-2 num">{r.limit}</td>
+                        <td className="px-2 py-2 num">{r.threshold}</td>
+                        <td className="px-2 py-2 num">{r.today}</td>
+                        <td className="px-2 py-2 num">{r.headroom}</td>
+                        <td className="px-2 py-2" style={{minWidth: 90}}>
+                          {r.used != null ? (
+                            <div className="flex items-center gap-2">
+                              <div className="flex-1 h-1.5 rounded overflow-hidden" style={{background: "rgba(255,255,255,0.08)"}}>
+                                <div style={{
+                                  width: `${r.used}%`, height: "100%",
+                                  background: r.used >= 90 ? "var(--bad)" : r.used >= 60 ? "var(--accent)" : "var(--good)",
+                                }} />
+                              </div>
+                              <span className="text-[10px] num" style={{color: "var(--muted)"}}>{Math.round(r.used)}%</span>
+                            </div>
+                          ) : <span style={{color: "var(--muted)"}}>—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
 
           <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
             <h2 className="font-medium">Daily Loss Limit</h2>

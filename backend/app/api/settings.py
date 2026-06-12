@@ -49,6 +49,7 @@ def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
         retry_interval_open=s.retry_interval_open,
         retry_interval_close=s.retry_interval_close,
         todays_realized_pnl=today_realized_pnl(db, s.user_id),
+        account_equity=get_account_equity(db, s.user_id),
         excluded_symbols=list(s.excluded_symbols or []),
         take_profit_pct=s.take_profit_pct,
         stop_loss_pct=s.stop_loss_pct,
