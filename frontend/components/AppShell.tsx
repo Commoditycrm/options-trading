@@ -7,7 +7,7 @@ import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
 import { Spinner } from "@/components/Spinner";
 import { useBusinessName } from "@/lib/branding";
-import type { SubscriberSettings, User } from "@/lib/types";
+import type { BrokerAccount, SubscriberSettings, User } from "@/lib/types";
 
 function IconBell() {
   return (
@@ -156,6 +156,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // subscribers receive notifications, but the bell is universal so
   // future trader-side notifications work without UI changes).
   const [unreadCount, setUnreadCount] = useState<number>(0);
+  // Broker connection accounts, for the global "Broker live" sidebar badge.
+  // null = not loaded yet (badge hidden until we know).
+  const [brokers, setBrokers] = useState<BrokerAccount[] | null>(null);
 
   async function refreshUnreadCount() {
     try {
@@ -213,6 +216,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     }
   });
 
+  // Broker connection state for the global "Broker live" badge. Refetched on
+  // navigation so connecting/disconnecting on the Brokers page reflects across
+  // the app without a manual refresh. Tolerant — a failure just keeps the last
+  // known state rather than blanking the badge.
+  useEffect(() => {
+    if (!getAccessToken()) return;
+    api<BrokerAccount[]>("/api/brokers").then(setBrokers).catch(() => {});
+  }, [pathname]);
+
   async function toggleSubscriberCopy() {
     if (!subCopy) return;
     const next = !subCopy.copy_enabled;
@@ -265,6 +277,20 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const nav = user.role === "trader" ? NAV_TRADER : NAV_SUBSCRIBER;
   const displayName = user.display_name || user.email.split("@")[0];
 
+  // Global broker-connection signal for the sidebar badge. null = unknown
+  // (badge hidden); live = at least one account connected; offline = accounts
+  // exist but none connected; none = no broker linked yet.
+  const brokerState: "live" | "offline" | "none" | null =
+    brokers === null ? null
+      : brokers.some(b => b.connection_status === "connected") ? "live"
+      : brokers.length > 0 ? "offline"
+      : "none";
+  const brokerBadge = {
+    live:    { color: "var(--good)",  label: "Broker live" },
+    offline: { color: "var(--bad)",   label: "Broker offline" },
+    none:    { color: "var(--muted)", label: "No broker" },
+  };
+
   return (
     // h-screen + overflow-hidden lock the outer frame to viewport height.
     // The sidebar fills it; only <main> scrolls internally when content overflows.
@@ -306,6 +332,27 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="text-[10px] uppercase tracking-widest" style={{ color: "var(--muted)" }}>
               {user.role}
             </div>
+            {brokerState && (
+              <div
+                className="text-[10px] flex items-center gap-1 mt-1"
+                title={
+                  brokerState === "live" ? "A broker connection is live"
+                    : brokerState === "offline" ? "Your broker is not connected — open Brokers to reconnect"
+                    : "No broker linked yet — open Brokers to connect"
+                }
+              >
+                <span
+                  aria-hidden
+                  style={{
+                    width: 7, height: 7, borderRadius: "50%",
+                    background: brokerBadge[brokerState].color,
+                    boxShadow: brokerState === "live" ? "0 0 5px var(--good)" : "none",
+                    display: "inline-block", flexShrink: 0,
+                  }}
+                />
+                <span style={{ color: "var(--text-2)" }}>{brokerBadge[brokerState].label}</span>
+              </div>
+            )}
           </div>
         </div>
 
