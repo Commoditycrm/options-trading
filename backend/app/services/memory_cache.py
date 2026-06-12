@@ -55,6 +55,7 @@ class SubscriberCacheEntry:
     daily_loss_limit: Decimal | None
     # Percentage-based risk controls (NULL = disabled).
     daily_loss_limit_pct: Decimal | None
+    daily_profit_limit_pct: Decimal | None
     per_trade_loss_limit_pct: Decimal | None
     max_drawdown_pct: Decimal | None
     max_drawdown_equity_baseline: Decimal | None
@@ -84,6 +85,7 @@ def _build_entry(db: Session, sub: SubscriberSettings) -> SubscriberCacheEntry:
         multiplier=sub.multiplier,
         daily_loss_limit=sub.daily_loss_limit,
         daily_loss_limit_pct=sub.daily_loss_limit_pct,
+        daily_profit_limit_pct=sub.daily_profit_limit_pct,
         per_trade_loss_limit_pct=sub.per_trade_loss_limit_pct,
         max_drawdown_pct=sub.max_drawdown_pct,
         max_drawdown_equity_baseline=sub.max_drawdown_equity_baseline,

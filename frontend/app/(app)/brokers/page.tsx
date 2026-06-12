@@ -173,7 +173,7 @@ export default function BrokersPage() {
                   <div className="font-medium">
                     {a.label}
                     <span className="text-xs uppercase ml-2 tracking-wider" style={{ color: "var(--muted)" }}>
-                      {brokerLabel(a.broker, role)}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
+                      {brokerLabel(a.broker, role, a.brokerage_name)}{a.is_paper ? " · paper" : ""}{a.supports_fractional ? " · fractional" : ""}
                     </span>
                   </div>
                   <div className="text-xs mt-1" style={{ color: statusColor(a.connection_status) }}>

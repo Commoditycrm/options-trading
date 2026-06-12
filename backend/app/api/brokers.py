@@ -483,6 +483,7 @@ def snaptrade_finish(
         encrypted_credentials=encrypt_json(creds),
         connection_status="pending",
         broker_account_number=account_number or None,
+        brokerage_name=brokerage_name,
     )
     try:
         info = adapter_for(acct, creds).verify_connection()

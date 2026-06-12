@@ -14,6 +14,7 @@ class SubscriberSettingsOut(BaseModel):
     daily_loss_limit: Decimal | None
     # Percentage-based risk controls (NULL = disabled).
     daily_loss_limit_pct: Decimal | None = None
+    daily_profit_limit_pct: Decimal | None = None
     per_trade_loss_limit_pct: Decimal | None = None
     max_drawdown_pct: Decimal | None = None
     max_drawdown_equity_baseline: Decimal | None = None
@@ -80,6 +81,12 @@ class DailyLossLimitIn(BaseModel):
 class DailyLossLimitPctIn(BaseModel):
     """Daily realized-loss limit as a % of account equity. Null to disable."""
     daily_loss_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("100"))
+
+
+class DailyProfitLimitPctIn(BaseModel):
+    """Daily realized-profit target as a % of account equity. When reached,
+    copy auto-pauses for the day. Null to disable."""
+    daily_profit_limit_pct: Decimal | None = Field(default=None, ge=Decimal("0"), le=Decimal("1000"))
 
 
 class PerTradeLossLimitPctIn(BaseModel):

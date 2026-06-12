@@ -80,6 +80,10 @@ class SubscriberSettings(Base, TimestampMixin):
 
     # ── Percentage-based risk controls ─────────────────────────────────────
     daily_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+    # Daily PROFIT target as % of account equity. When today's realized P&L
+    # reaches +this%, copy is auto-paused for the day (lock in gains) — the
+    # mirror image of daily_loss_limit_pct.
+    daily_profit_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     per_trade_loss_limit_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     max_drawdown_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
     max_drawdown_equity_baseline: Mapped[Decimal | None] = mapped_column(Numeric(20, 4), nullable=True)

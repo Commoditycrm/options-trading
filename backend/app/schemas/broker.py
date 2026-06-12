@@ -94,6 +94,9 @@ class ConnectBrokerIn(BaseModel):
 class BrokerAccountOut(BaseModel):
     id: uuid.UUID
     broker: BrokerName
+    # Real brokerage name for SnapTrade connections (e.g. "Webull"); NULL for
+    # direct integrations. Traders/admins see it; subscribers stay white-labeled.
+    brokerage_name: str | None = None
     label: str
     is_paper: bool
     supports_fractional: bool

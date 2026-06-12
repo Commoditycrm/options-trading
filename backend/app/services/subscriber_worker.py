@@ -171,6 +171,23 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
                     })
                     return "daily_loss_limit_pct"
 
+        # 1b-profit. Daily PROFIT target as % of equity — lock in gains and
+        # pause copy for the rest of the day once today's realized P&L reaches
+        # +this%. Mirror image of the daily-loss kill switch.
+        if entry.daily_profit_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_target = equity * entry.daily_profit_limit_pct / _D(100)
+                todays_pnl = today_realized_pnl(db, entry.user_id)
+                if todays_pnl >= dollar_target:
+                    _auto_pause(db, pc, entry.user_id, "daily_profit_limit", {
+                        "daily_profit_limit_pct": str(entry.daily_profit_limit_pct),
+                        "dollar_target": str(dollar_target.quantize(_D("0.01"))),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "account_equity": str(equity),
+                    })
+                    return "daily_profit_limit"
+
         # 1c. Per-trade loss limit as % of equity (last closed round-trip).
         if entry.per_trade_loss_limit_pct is not None:
             equity = get_account_equity(db, entry.user_id)

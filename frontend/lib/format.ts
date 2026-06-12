@@ -22,12 +22,17 @@ export function brokerName(broker: BrokerName): string {
 
 /** Role-aware broker label. Subscribers see a generic "Brokerage" so the
  *  platform stays broker-agnostic to them; traders/admins see the real name.
- *  Single source of truth for the subscriber white-label rule. */
+ *  For SnapTrade connections, `brokerageName` (the underlying broker, e.g.
+ *  "Webull") is shown as "Webull (via SnapTrade)". Single source of truth for
+ *  the subscriber white-label rule. */
 export function brokerLabel(
   broker: BrokerName,
   role: Role | null | undefined,
+  brokerageName?: string | null,
 ): string {
-  return role === "subscriber" ? "Brokerage" : brokerName(broker);
+  if (role === "subscriber") return "Brokerage";
+  if (broker === "snaptrade" && brokerageName) return `${brokerageName} (via SnapTrade)`;
+  return brokerName(broker);
 }
 
 const DATETIME_OPTS: Intl.DateTimeFormatOptions = {

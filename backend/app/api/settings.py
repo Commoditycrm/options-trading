@@ -9,6 +9,7 @@ from app.models.user import User, UserRole
 from app.schemas.settings import (
     DailyLossLimitIn,
     DailyLossLimitPctIn,
+    DailyProfitLimitPctIn,
     ExcludedSymbolsIn,
     FollowTraderIn,
     MaxDrawdownPctIn,
@@ -38,6 +39,7 @@ def _sub_out(s: SubscriberSettings, db: Session) -> SubscriberSettingsOut:
         multiplier=s.multiplier,
         daily_loss_limit=s.daily_loss_limit,
         daily_loss_limit_pct=s.daily_loss_limit_pct,
+        daily_profit_limit_pct=s.daily_profit_limit_pct,
         per_trade_loss_limit_pct=s.per_trade_loss_limit_pct,
         max_drawdown_pct=s.max_drawdown_pct,
         max_drawdown_equity_baseline=s.max_drawdown_equity_baseline,
@@ -240,6 +242,34 @@ def set_daily_loss_limit_pct(
         entity_type="subscriber_settings", entity_id=user.id,
         metadata={"old": str(old) if old is not None else None,
                   "new": str(payload.daily_loss_limit_pct) if payload.daily_loss_limit_pct is not None else None},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    from app.services import memory_cache
+    memory_cache.invalidate_subscriber(user.id)
+    db.refresh(s)
+    return _sub_out(s, db)
+
+
+@router.patch("/subscriber/daily-profit-limit-pct", response_model=SubscriberSettingsOut)
+def set_daily_profit_limit_pct(
+    payload: DailyProfitLimitPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_subscriber),
+) -> SubscriberSettingsOut:
+    """Set (or clear) the daily PROFIT target as a % of account equity. When
+    today's realized P&L reaches +this%, copy auto-pauses for the day."""
+    s = db.get(SubscriberSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    old = s.daily_profit_limit_pct
+    s.daily_profit_limit_pct = payload.daily_profit_limit_pct
+    audit.record(
+        db, actor_user_id=user.id, action="subscriber.daily_profit_limit_pct_changed",
+        entity_type="subscriber_settings", entity_id=user.id,
+        metadata={"old": str(old) if old is not None else None,
+                  "new": str(payload.daily_profit_limit_pct) if payload.daily_profit_limit_pct is not None else None},
         ip_address=client_ip(request),
     )
     db.commit()

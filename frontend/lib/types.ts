@@ -13,6 +13,9 @@ export type BrokerName = "alpaca" | "ibkr" | "webull" | "snaptrade" | "mock";
 export interface BrokerAccount {
   id: string;
   broker: BrokerName;
+  /** Real brokerage name for SnapTrade connections (e.g. "Webull"); null
+   *  for direct integrations. */
+  brokerage_name: string | null;
   label: string;
   is_paper: boolean;
   supports_fractional: boolean;
@@ -138,6 +141,10 @@ export interface SubscriberSettings {
   copy_enabled: boolean;
   multiplier: string;
   daily_loss_limit: string | null;
+  /** Daily realized-loss limit as % of equity (null = disabled). */
+  daily_loss_limit_pct: string | null;
+  /** Daily realized-profit target as % of equity; auto-pauses copy when hit. */
+  daily_profit_limit_pct: string | null;
   /** Retry policy when a mirror order fails with a transient (broker-
    *  disconnect) error. NEVER = REJECT immediately on first failure. */
   retry_interval_open: RetryInterval;

@@ -58,6 +58,11 @@ class BrokerAccount(Base, TimestampMixin):
     # Encrypted JSON blob. Decrypt via services.crypto.decrypt_json.
     encrypted_credentials: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # For SnapTrade (aggregator) connections: the underlying brokerage's real
+    # name (e.g. "Webull", "Robinhood"), captured at connect time. NULL for
+    # direct integrations where `broker` already names the brokerage.
+    brokerage_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
     # Broker's own account number/id for display
     broker_account_number: Mapped[str | None] = mapped_column(String(120), nullable=True)
     connection_status: Mapped[str] = mapped_column(String(40), default="connected", nullable=False)

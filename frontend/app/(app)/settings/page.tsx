@@ -24,6 +24,10 @@ export default function SettingsPage() {
   const [multBusy, setMultBusy] = useState(false);
   const [limitInput, setLimitInput] = useState("");
   const [limitBusy, setLimitBusy] = useState(false);
+  const [lossPctInput, setLossPctInput] = useState("");
+  const [lossPctBusy, setLossPctBusy] = useState(false);
+  const [profitPctInput, setProfitPctInput] = useState("");
+  const [profitPctBusy, setProfitPctBusy] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -34,6 +38,8 @@ export default function SettingsPage() {
         setSub(s);
         setMultInput(parseFloat(s.multiplier).toString());
         setLimitInput(s.daily_loss_limit ?? "");
+        setLossPctInput(s.daily_loss_limit_pct ?? "");
+        setProfitPctInput(s.daily_profit_limit_pct ?? "");
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
@@ -47,10 +53,13 @@ export default function SettingsPage() {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const e = evt as any;
     if (e?.type === "copy.auto_paused") {
-      notify.error(
-        `Copy trading auto-paused — today's loss ($${e.todays_realized_pnl}) hit your daily limit ($${e.daily_loss_limit}).`,
-        { autoClose: false }   // sticky — important enough to require dismissal
-      );
+      // Reason-aware message — the same event fires for loss kill-switches,
+      // the profit target, drawdown, etc.
+      const pnl = e.todays_realized_pnl;
+      const msg = e.reason === "daily_profit_limit"
+        ? `Copy trading auto-paused — today's profit ($${pnl}) hit your daily target. Gains locked in for the day.`
+        : `Copy trading auto-paused — today's realized P&L ($${pnl}) hit your daily limit.`;
+      notify.error(msg, { autoClose: false });   // sticky — requires dismissal
       // Pull fresh settings so the UI's copy toggle now shows OFF.
       api<SubscriberSettings>("/api/settings/subscriber").then(setSub);
     }
@@ -100,6 +109,35 @@ export default function SettingsPage() {
       notify.fromError(e, "Could not update daily loss limit");
     } finally {
       setLimitBusy(false);
+    }
+  }
+  async function savePctLimit(
+    kind: "loss" | "profit",
+    value: string,
+    setBusy: (b: boolean) => void,
+  ) {
+    setBusy(true);
+    try {
+      const trimmed = value.trim();
+      const path = kind === "loss"
+        ? "/api/settings/subscriber/daily-loss-limit-pct"
+        : "/api/settings/subscriber/daily-profit-limit-pct";
+      const key = kind === "loss" ? "daily_loss_limit_pct" : "daily_profit_limit_pct";
+      const s = await api<SubscriberSettings>(path, {
+        method: "PATCH",
+        body: JSON.stringify({ [key]: trimmed === "" ? null : trimmed }),
+      });
+      setSub(s);
+      const set = kind === "loss" ? s.daily_loss_limit_pct : s.daily_profit_limit_pct;
+      notify.success(
+        set
+          ? `Daily ${kind} limit set to ${set}% of equity`
+          : `Daily ${kind} limit cleared`,
+      );
+    } catch (e) {
+      notify.fromError(e, `Could not update daily ${kind} limit`);
+    } finally {
+      setBusy(false);
     }
   }
   async function setRetryInterval(direction: "open" | "close", value: RetryInterval) {
@@ -288,6 +326,65 @@ export default function SettingsPage() {
                   Clear
                 </button>
               )}
+            </div>
+          </section>
+
+          {/* Percentage-based daily limits — % of account equity. */}
+          <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+            <h2 className="font-medium">Daily limits (% of equity)</h2>
+            <p className="text-sm" style={{color: "var(--muted)"}}>
+              Set as a percentage of your account equity. Copy trading auto-pauses
+              for the day when today&rsquo;s realized loss hits the loss limit, or
+              today&rsquo;s realized profit hits the profit target. Resets daily at
+              UTC midnight. Leave blank to disable.
+            </p>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-1">
+                <div className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>Daily loss limit</div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" step="0.1" min="0" max="100"
+                    placeholder="(no limit)"
+                    className="w-28 p-2 rounded bg-transparent border" style={{borderColor: "var(--border)"}}
+                    value={lossPctInput}
+                    onChange={(e) => setLossPctInput(e.target.value)}
+                  />
+                  <span style={{color: "var(--muted)"}}>%</span>
+                  <button
+                    onClick={() => savePctLimit("loss", lossPctInput, setLossPctBusy)}
+                    disabled={lossPctBusy || lossPctInput === (sub.daily_loss_limit_pct ?? "")}
+                    className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
+                    style={{background: "var(--accent)", color: "#06121f"}}
+                  >
+                    <span>Save</span>
+                    {lossPctBusy && <Spinner />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <div className="text-[10px] uppercase tracking-wider" style={{color: "var(--muted)"}}>Daily profit target</div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number" step="0.1" min="0" max="1000"
+                    placeholder="(no target)"
+                    className="w-28 p-2 rounded bg-transparent border" style={{borderColor: "var(--border)"}}
+                    value={profitPctInput}
+                    onChange={(e) => setProfitPctInput(e.target.value)}
+                  />
+                  <span style={{color: "var(--muted)"}}>%</span>
+                  <button
+                    onClick={() => savePctLimit("profit", profitPctInput, setProfitPctBusy)}
+                    disabled={profitPctBusy || profitPctInput === (sub.daily_profit_limit_pct ?? "")}
+                    className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
+                    style={{background: "var(--accent)", color: "#06121f"}}
+                  >
+                    <span>Save</span>
+                    {profitPctBusy && <Spinner />}
+                  </button>
+                </div>
+              </div>
             </div>
           </section>
 
