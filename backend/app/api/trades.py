@@ -1,3 +1,4 @@
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
@@ -238,6 +239,7 @@ def _submit_to_broker_in_background(
         try:
             creds = decrypt_json(acct.encrypted_credentials)
             adapter = adapter_for(acct, creds)
+            _t0 = time.monotonic()
             result = place_order_with_recovery(
                 adapter,
                 BrokerOrderRequest(
@@ -294,6 +296,7 @@ def _submit_to_broker_in_background(
                 _notify_followers_trader_rejected(db, order, order.reject_reason)
             return
 
+        order.broker_ms = int((time.monotonic() - _t0) * 1000)
         order.broker_order_id = result.broker_order_id
         order.status = result.status
         order.submitted_at = result.submitted_at
@@ -313,52 +316,33 @@ def _submit_to_broker_in_background(
         events.publish(actor.id, copy_engine._order_event("order.updated", order))
 
         if will_fanout:
-            # Two dispatch paths:
+            # Optimized fan-out: read eligible subscribers from the in-memory
+            # cache and batch-insert one pending_copies row each (~ms), then
+            # the async worker pool places the mirror orders in PARALLEL. This
+            # is the same fast path external-trade detection uses — far faster
+            # than the legacy in-process ThreadPool enumeration that ran here
+            # before (DB enumeration + per-subscriber serial overhead).
             #
-            #   1. Redis Streams (production / scale): enumerate targets +
-            #      XADD one message per (subscriber, broker_account). The
-            #      worker pool consumes and places mirror orders in parallel.
-            #      Returns immediately — broker calls happen in workers, the
-            #      subscriber's UI updates via order.copy_submitted SSE
-            #      published from inside process_one_fanout.
-            #
-            #   2. In-process (no Redis configured, e.g. early dev):
-            #      copy_engine.fanout runs the ThreadPoolExecutor path
-            #      inline. Same observable outcome.
-            #
-            # Either way, audit "trader.fanout_dispatched" tracks the
-            # decision; the per-target submitted/error/skipped audit lives
-            # in process_one_fanout itself (so we don't double-count).
+            # Stamp fanout_published_at so the Performance page can split
+            # platform vs broker latency precisely.
+            order.fanout_published_at = datetime.now(timezone.utc)
             if fanout_stream.is_configured():
+                # Redis Streams stays available as an opt-in for multi-pod scale.
                 targets = copy_engine.enumerate_fanout_targets(db, actor.id)
                 count = fanout_stream.publish_targets(order.id, targets)
+                db.commit()
                 audit.record(
-                    db,
-                    actor_user_id=actor.id,
-                    action="trader.fanout_dispatched",
-                    entity_type="order",
-                    entity_id=order.id,
-                    metadata={
-                        "dispatch": "redis_stream",
-                        "target_count": count,
-                    },
+                    db, actor_user_id=actor.id, action="trader.fanout_dispatched",
+                    entity_type="order", entity_id=order.id,
+                    metadata={"dispatch": "redis_stream", "target_count": count},
                 )
                 db.commit()
             else:
-                fan_results = copy_engine.fanout(db, order, actor)
+                queued = copy_engine.queue_fanout(db, order, actor)
                 audit.record(
-                    db,
-                    actor_user_id=actor.id,
-                    action="trader.fanout_complete",
-                    entity_type="order",
-                    entity_id=order.id,
-                    metadata={
-                        "dispatch": "in_process",
-                        "subscriber_count": len({r.subscriber_user_id for r in fan_results}),
-                        "submitted": sum(1 for r in fan_results if r.status == "submitted"),
-                        "errors": sum(1 for r in fan_results if r.status == "error"),
-                        "skipped": sum(1 for r in fan_results if r.status.startswith("skipped")),
-                    },
+                    db, actor_user_id=actor.id, action="trader.fanout_dispatched",
+                    entity_type="order", entity_id=order.id,
+                    metadata={"dispatch": "queue", "queued": queued},
                 )
                 db.commit()
 
@@ -720,6 +704,13 @@ def fanout_performance(
     Powers the "Fanout Performance" UI in the trader's account — no extra
     DB writes, purely a read of existing columns.
     """
+    def _median(xs: list[int]) -> int | None:
+        if not xs:
+            return None
+        s = sorted(xs)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) // 2
+
     # Fetch this trader's most recent orders that were broadcast to
     # subscribers. parent_order_id IS NULL filters out subscriber mirrors;
     # fanned_out_to_subscribers=True means we attempted fanout.
@@ -789,11 +780,28 @@ def fanout_performance(
         # and aware datetimes during comparison.
         _SENTINEL = datetime.max.replace(tzinfo=timezone.utc)
         subscribers_rows: list[dict] = []
+        pub = p.fanout_published_at
+        sub_totals: list[int] = []      # published -> submitted, per sub
+        sub_platforms: list[int] = []   # total - broker, per sub
+        sub_brokers: list[int] = []     # broker call duration, per sub
         for c in sorted(children, key=lambda x: (x.submitted_at or x.created_at or _SENTINEL)):
             u_info = subs_by_id.get(c.user_id, {})
             child_lag_ms = None
             if c.submitted_at and p.created_at:
                 child_lag_ms = max(0, int((c.submitted_at - p.created_at).total_seconds() * 1000))
+            # Per-subscriber end-to-end from when fan-out was published.
+            total_ms_sub = None
+            if c.submitted_at and pub:
+                total_ms_sub = max(0, int((c.submitted_at - pub).total_seconds() * 1000))
+            broker_ms_sub = c.broker_ms
+            platform_ms_sub = (max(0, total_ms_sub - (broker_ms_sub or 0))
+                               if total_ms_sub is not None else None)
+            if total_ms_sub is not None:
+                sub_totals.append(total_ms_sub)
+                if platform_ms_sub is not None:
+                    sub_platforms.append(platform_ms_sub)
+            if broker_ms_sub is not None:
+                sub_brokers.append(broker_ms_sub)
             subscribers_rows.append({
                 "child_order_id": str(c.id),
                 "user_id": str(c.user_id),
@@ -806,8 +814,17 @@ def fanout_performance(
                 "child_created_at": c.created_at.isoformat() if c.created_at else None,
                 "child_submitted_at": c.submitted_at.isoformat() if c.submitted_at else None,
                 "subscriber_lag_ms": child_lag_ms,
+                "broker_ms": broker_ms_sub,
+                "platform_ms": platform_ms_sub,
+                "total_ms": total_ms_sub,
                 "reject_reason": c.reject_reason,
             })
+
+        # API → broker lag: the trader's own broker round-trip.
+        api_broker_lag_ms = p.broker_ms
+        if api_broker_lag_ms is None and p.submitted_at and p.created_at:
+            api_broker_lag_ms = max(0, int((p.submitted_at - p.created_at).total_seconds() * 1000))
+        within_1s = sum(1 for t in sub_totals if t <= 1000)
 
         out.append({
             "order_id": str(p.id),
@@ -815,12 +832,30 @@ def fanout_performance(
             "side": p.side.value,
             "quantity": str(p.quantity),
             "instrument_type": p.instrument_type.value,
-            "submitted_at": p.submitted_at.isoformat() if p.submitted_at else None,
+            # Timestamps (match the comparison app's columns)
+            "trader_submitted_at": p.created_at.isoformat() if p.created_at else None,
+            "broker_accepted_at": p.submitted_at.isoformat() if p.submitted_at else None,
             "detected_at": p.created_at.isoformat() if p.created_at else None,
+            "fanout_published_at": pub.isoformat() if pub else None,
+            "all_subs_completed_at": fanout_completed_at.isoformat() if fanout_completed_at else None,
+            # Back-compat alias
+            "submitted_at": p.submitted_at.isoformat() if p.submitted_at else None,
             "fanout_completed_at": fanout_completed_at.isoformat() if fanout_completed_at else None,
+            # Lags
+            "api_broker_lag_ms": api_broker_lag_ms,
             "detection_lag_ms": det_lag_ms,
             "fanout_duration_ms": fanout_ms,
             "total_ms": total_ms,
+            # Per-subscriber latency split (medians across subs)
+            "platform_lag_ms": _median(sub_platforms),
+            "broker_lag_median_ms": _median(sub_brokers),
+            "broker_lag_min_ms": min(sub_brokers) if sub_brokers else None,
+            "broker_lag_avg_ms": int(sum(sub_brokers) / len(sub_brokers)) if sub_brokers else None,
+            "broker_lag_max_ms": max(sub_brokers) if sub_brokers else None,
+            "median_total_ms": _median(sub_totals),
+            "slowest_total_ms": max(sub_totals) if sub_totals else None,
+            "within_1s_count": within_1s,
+            # Counts
             "subscribers_targeted": len(children),
             "subscribers_accepted": sub_accepted,
             "subscribers_rejected": sub_rejected,

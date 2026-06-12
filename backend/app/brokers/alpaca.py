@@ -10,6 +10,7 @@ request types for both — only the symbol shape distinguishes them.
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -114,6 +115,15 @@ class AlpacaCredentials:
     paper: bool = True
 
 
+# A fresh AlpacaAdapter is built per order (adapter_for), so a per-instance
+# client would pay a cold TLS handshake on every call (~hundreds of ms — a
+# major chunk of fan-out latency). Cache the TradingClient process-wide, keyed
+# by account, so the underlying keep-alive connection is reused across orders.
+# urllib3's pooled session is safe for concurrent requests from the worker pool.
+_CLIENT_CACHE: dict[tuple[str, bool], "TradingClient"] = {}
+_CLIENT_CACHE_LOCK = threading.Lock()
+
+
 class AlpacaAdapter(BrokerAdapter):
     name = "alpaca"
 
@@ -122,13 +132,20 @@ class AlpacaAdapter(BrokerAdapter):
         self._client: TradingClient | None = None
 
     def _c(self) -> TradingClient:
-        if self._client is None:
-            self._client = TradingClient(
-                api_key=self.credentials["api_key"],
-                secret_key=self.credentials["api_secret"],
-                paper=bool(self.credentials.get("paper", True)),
-            )
-        return self._client
+        if self._client is not None:
+            return self._client
+        key = (self.credentials["api_key"], bool(self.credentials.get("paper", True)))
+        with _CLIENT_CACHE_LOCK:
+            client = _CLIENT_CACHE.get(key)
+            if client is None:
+                client = TradingClient(
+                    api_key=self.credentials["api_key"],
+                    secret_key=self.credentials["api_secret"],
+                    paper=bool(self.credentials.get("paper", True)),
+                )
+                _CLIENT_CACHE[key] = client
+        self._client = client
+        return client
 
     # ── connection ────────────────────────────────────────────────────────
 

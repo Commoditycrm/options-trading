@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -323,6 +324,9 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
                     sl_price = ref_price * (1 - multiplier * entry.stop_loss_pct / _Decimal(100))
                     sl_price = sl_price.quantize(_Decimal("0.01"))
 
+        # Time the broker round-trip for the Performance page's per-subscriber
+        # broker-latency column.
+        _broker_t0 = time.monotonic()
         # Try bracket first (IBKR native OCA); fall back to plain entry if
         # the adapter doesn't support it (e.g. Alpaca, Webull, Mock).
         if tp_price is not None or sl_price is not None:
@@ -389,6 +393,7 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
             events.publish(entry.user_id, _order_event("order.copy_failed", child))
             return "broker_failed"
 
+        child.broker_ms = int((time.monotonic() - _broker_t0) * 1000)
         child.status = resp.status
         child.broker_order_id = resp.broker_order_id
         child.submitted_at = resp.submitted_at

@@ -103,6 +103,13 @@ class Order(Base, TimestampMixin):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     reject_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Latency instrumentation (Performance page). broker_ms = duration of the
+    # broker place_order call for THIS order (parent or child). On a parent
+    # (trader) order, fanout_published_at = when the fan-out was enqueued, so
+    # per-subscriber platform-vs-broker latency can be split precisely.
+    broker_ms: Mapped[int | None] = mapped_column(nullable=True)
+    fanout_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # True when this order was broadcast to subscribers via the copy-engine
     # fanout. False for: subscriber-owned orders, trader orders placed while
     # copy was paused, and orders placed with skip_fanout (e.g. Exit All "Just
