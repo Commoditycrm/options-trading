@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -600,6 +600,61 @@ def list_my_brokers(
         select(BrokerAccount).where(BrokerAccount.user_id == user.id)
         .order_by(BrokerAccount.created_at.desc())
     ).scalars())
+
+
+@router.post("/sync-orders")
+def sync_orders(
+    scope: str = Query("all", pattern="^(open|filled|all)$",
+                       description="open = pull broker-placed orders; filled = sync fills; all = both"),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Manual "Bring Orders" — pull the caller's broker orders into the app on
+    demand instead of waiting for the background poller.
+      - filled: sync fills across every connected broker (any role) — surfaces
+        externally-filled trades.
+      - open:   pull broker-placed orders for connected Alpaca accounts and
+        record any not already known (Alpaca only; never fans out).
+    Returns per-bucket counts. Partial failures are reported, not fatal."""
+    from app.services import fills_sync
+    from app.services.external_trade_poller import pull_orders_for_account
+
+    new_open = 0
+    fills_added = 0
+    orders_added = 0
+    errors: list[str] = []
+
+    if scope in ("filled", "all"):
+        try:
+            r = fills_sync.sync_user_fills(db, user.id)
+            db.commit()
+            fills_added = r.get("fills_added", 0)
+            orders_added = r.get("orders_added", 0)
+        except Exception as exc:  # noqa: BLE001
+            db.rollback()
+            errors.append(f"fills: {str(exc)[:160]}")
+
+    if scope in ("open", "all"):
+        accts = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.connection_status == "connected",
+                BrokerAccount.broker == BrokerName.ALPACA,
+            )
+        ).scalars().all()
+        for acct in accts:
+            try:
+                new_open += pull_orders_for_account(db, acct, user)
+            except Exception as exc:  # noqa: BLE001
+                db.rollback()
+                errors.append(f"{acct.id}: {str(exc)[:120]}")
+
+    return {
+        "new_open_orders": new_open,
+        "fills_added": fills_added,
+        "orders_added": orders_added,
+        "errors": errors,
+    }
 
 
 @router.post("/{account_id}/refresh-balance", response_model=BrokerAccountOut)

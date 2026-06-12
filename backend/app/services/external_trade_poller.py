@@ -240,6 +240,52 @@ def _handle_external_order(
 
 # ── per-account poll ────────────────────────────────────────────────────────
 
+def pull_orders_for_account(db: SessionLocal, acct: BrokerAccount, owner: User) -> int:
+    """Manual on-demand pull: fetch this Alpaca account's recent broker orders
+    and record any not already in our DB. Unlike the auto-poller this works for
+    ANY role and NEVER fans out (do_fanout=False) — it's purely to surface the
+    owner's own broker-placed orders in the app. Returns the count recorded.
+    Caller owns the session lifecycle. Non-Alpaca accounts are a no-op."""
+    if acct.broker != BrokerName.ALPACA:
+        return 0
+    try:
+        creds = decrypt_json(acct.encrypted_credentials)
+        adapter = AlpacaAdapter(creds)
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        req = GetOrdersRequest(status=QueryOrderStatus.ALL, limit=ORDERS_PER_POLL)
+        orders_raw = adapter._c().get_orders(filter=req)
+    except Exception:  # noqa: BLE001
+        log.exception("pull_orders_for_account: fetch failed for acct=%s", acct.id)
+        return 0
+
+    recorded = 0
+    for raw_order in orders_raw or []:
+        broker_oid = str(getattr(raw_order, "id", "") or "")
+        if not broker_oid:
+            continue
+        # Already in our DB?
+        if db.execute(
+            select(Order.id).where(
+                Order.broker_account_id == acct.id,
+                Order.broker_order_id == broker_oid,
+            )
+        ).first():
+            continue
+        # Placed via our own app (client_order_id is a local Order UUID)?
+        client_oid = str(getattr(raw_order, "client_order_id", "") or "")
+        if client_oid:
+            try:
+                if db.get(Order, uuid.UUID(client_oid)):
+                    continue
+            except (ValueError, TypeError):
+                pass
+        order = _handle_external_order(db, acct, owner, raw_order, broker_oid, do_fanout=False)
+        if order is not None:
+            recorded += 1
+    return recorded
+
+
 def _poll_one_account(account_id: uuid.UUID) -> int:
     """Pull recent orders for one Alpaca account and dispatch fanout for any
     that are new + externally placed. Returns the count dispatched.

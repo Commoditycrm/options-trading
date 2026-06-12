@@ -59,6 +59,7 @@ export default function BrokersPage() {
 
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState<Record<string, boolean>>({});
+  const [syncing, setSyncing] = useState<null | "open" | "filled">(null);
 
   async function load() {
     setAccounts(await api<BrokerAccount[]>("/api/brokers"));
@@ -130,6 +131,35 @@ export default function BrokersPage() {
     }
   }
 
+  async function bringOrders(scope: "open" | "filled") {
+    setSyncing(scope);
+    try {
+      const res = await api<{ new_open_orders: number; fills_added: number; orders_added: number; errors: string[] }>(
+        `/api/brokers/sync-orders?scope=${scope}`,
+        { method: "POST" },
+      );
+      if (scope === "open") {
+        notify[res.new_open_orders > 0 ? "success" : "info"](
+          res.new_open_orders > 0
+            ? `Pulled ${res.new_open_orders} order${res.new_open_orders === 1 ? "" : "s"} — see Order History`
+            : "No new orders found at your broker",
+        );
+      } else {
+        const n = res.orders_added + res.fills_added;
+        notify[n > 0 ? "success" : "info"](
+          n > 0
+            ? `Synced ${res.fills_added} fill${res.fills_added === 1 ? "" : "s"}${res.orders_added ? ` + ${res.orders_added} filled order(s)` : ""} — see Order History`
+            : "No new fills found",
+        );
+      }
+      if (res.errors?.length) notify.warn(`Some accounts had issues: ${res.errors[0]}`);
+    } catch (e) {
+      notify.fromError(e, "Could not bring orders");
+    } finally {
+      setSyncing(null);
+    }
+  }
+
   async function remove(id: string) {
     if (!confirm("Disconnect this brokerage?")) return;
     try {
@@ -163,7 +193,31 @@ export default function BrokersPage() {
       </p>
 
       <section className="space-y-3">
-        <h2 className="text-sm uppercase tracking-wider" style={{ color: "var(--muted)" }}>Your connections</h2>
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <h2 className="text-sm uppercase tracking-wider" style={{ color: "var(--muted)" }}>Your connections</h2>
+          {accounts.length > 0 && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => bringOrders("open")}
+                disabled={syncing !== null}
+                title="Pull orders placed directly at your broker into the app"
+                className="btn-ghost px-3 py-1.5 text-sm inline-flex items-center gap-1.5"
+              >
+                <span>Bring Open Orders</span>
+                {syncing === "open" && <Spinner />}
+              </button>
+              <button
+                onClick={() => bringOrders("filled")}
+                disabled={syncing !== null}
+                title="Sync filled trades from your broker into the app"
+                className="btn-ghost px-3 py-1.5 text-sm inline-flex items-center gap-1.5"
+              >
+                <span>Bring Filled Orders</span>
+                {syncing === "filled" && <Spinner />}
+              </button>
+            </div>
+          )}
+        </div>
         {accounts.length === 0 && <p style={{ color: "var(--muted)" }}>No brokers connected yet — fill in the form below to add one.</p>}
         <div className="space-y-2">
           {accounts.map(a => (
