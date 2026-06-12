@@ -122,6 +122,10 @@ class AlpacaCredentials:
 # urllib3's pooled session is safe for concurrent requests from the worker pool.
 _CLIENT_CACHE: dict[tuple[str, bool], "TradingClient"] = {}
 _CLIENT_CACHE_LOCK = threading.Lock()
+# Market-data clients are paper/live-agnostic (data feed is the same), keyed by
+# api_key only. Cached process-wide so quote calls reuse the keep-alive session.
+_STOCK_DATA_CACHE: dict[str, Any] = {}
+_OPTION_DATA_CACHE: dict[str, Any] = {}
 
 
 class AlpacaAdapter(BrokerAdapter):
@@ -286,6 +290,69 @@ class AlpacaAdapter(BrokerAdapter):
     def list_recent_activities(self) -> list[Any]:
         """Activities = fills, dividends, etc. Caller filters by type."""
         return self._c().get_account_activities()
+
+    # ── market data (quotes) ──────────────────────────────────────────────
+    # Best-effort. Returns {bid, ask, mid} (Decimals or None). Any failure —
+    # no data entitlement, unknown symbol, SDK lacking option data — yields
+    # all-None rather than raising, so the trade panel degrades to "—".
+
+    def _stock_data_client(self) -> Any:
+        from alpaca.data.historical import StockHistoricalDataClient
+        key = self.credentials["api_key"]
+        with _CLIENT_CACHE_LOCK:
+            c = _STOCK_DATA_CACHE.get(key)
+            if c is None:
+                c = StockHistoricalDataClient(
+                    self.credentials["api_key"], self.credentials["api_secret"]
+                )
+                _STOCK_DATA_CACHE[key] = c
+        return c
+
+    def _option_data_client(self) -> Any:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        key = self.credentials["api_key"]
+        with _CLIENT_CACHE_LOCK:
+            c = _OPTION_DATA_CACHE.get(key)
+            if c is None:
+                c = OptionHistoricalDataClient(
+                    self.credentials["api_key"], self.credentials["api_secret"]
+                )
+                _OPTION_DATA_CACHE[key] = c
+        return c
+
+    @staticmethod
+    def _mid(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            return ((bid + ask) / 2).quantize(Decimal("0.0001"))
+        return None
+
+    def get_stock_quote(self, symbol: str) -> dict[str, Decimal | None]:
+        sym = symbol.upper()
+        try:
+            from alpaca.data.requests import StockLatestQuoteRequest
+            r = self._stock_data_client().get_stock_latest_quote(
+                StockLatestQuoteRequest(symbol_or_symbols=sym)
+            )
+            q = r.get(sym)
+            bid = _dec_or_none(getattr(q, "bid_price", None))
+            ask = _dec_or_none(getattr(q, "ask_price", None))
+            return {"bid": bid, "ask": ask, "mid": self._mid(bid, ask)}
+        except Exception:  # noqa: BLE001
+            return {"bid": None, "ask": None, "mid": None}
+
+    def get_option_quote(self, occ: str) -> dict[str, Decimal | None]:
+        sym = occ.upper()
+        try:
+            from alpaca.data.requests import OptionLatestQuoteRequest
+            r = self._option_data_client().get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=sym)
+            )
+            q = r.get(sym)
+            bid = _dec_or_none(getattr(q, "bid_price", None))
+            ask = _dec_or_none(getattr(q, "ask_price", None))
+            return {"bid": bid, "ask": ask, "mid": self._mid(bid, ask)}
+        except Exception:  # noqa: BLE001
+            return {"bid": None, "ask": None, "mid": None}
 
     def list_option_contracts(
         self,

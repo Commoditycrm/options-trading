@@ -157,6 +157,10 @@ export default function TradePanelPage() {
   const [slPct, setSlPct] = useState("");
   const [last, setLast] = useState<Order | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  // Live quote (bid/ask/mid) for the selected contract — advisory, may be
+  // delayed depending on the Alpaca data entitlement.
+  const [quote, setQuote] = useState<{ bid: number | null; ask: number | null; mid: number | null; available: boolean } | null>(null);
+  const [quoteLoading, setQuoteLoading] = useState(false);
 
   // Open positions table — owned by the shared component. We keep a ref so
   // we can ask it to refresh after a fresh order or exit-all.
@@ -207,6 +211,45 @@ export default function TradePanelPage() {
     if (sym) setSymbol(sym.toUpperCase());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The contract to quote: the OCC option symbol once fully specified, else the
+  // bare ticker for a stock order.
+  const quoteOcc = useMemo(
+    () => (instrument === "option" ? buildOccSymbol(symbol, expiry, strike, right) : null),
+    [instrument, symbol, expiry, strike, right],
+  );
+  const quoteKey = instrument === "option" ? (quoteOcc ?? "") : symbol.trim().toUpperCase();
+
+  // Fetch the live quote when the contract changes (debounced). Autofills the
+  // limit price to mid when the limit is empty so the default lands on mid.
+  useEffect(() => {
+    if (!quoteKey) { setQuote(null); return; }
+    let cancelled = false;
+    setQuoteLoading(true);
+    const t = setTimeout(async () => {
+      try {
+        const qs = instrument === "option" && quoteOcc
+          ? `occ=${encodeURIComponent(quoteOcc)}`
+          : `symbol=${encodeURIComponent(quoteKey)}`;
+        const r = await api<{ bid: number | string | null; ask: number | string | null; mid: number | string | null; available: boolean }>(
+          `/api/marketdata/quote?${qs}`,
+        );
+        if (cancelled) return;
+        const num = (v: number | string | null) => (v == null ? null : Number(v));
+        const q = { bid: num(r.bid), ask: num(r.ask), mid: num(r.mid), available: !!r.available };
+        setQuote(q);
+        if (q.mid != null && (orderType === "limit" || orderType === "stop_limit") && limit.trim() === "") {
+          setLimit(q.mid.toFixed(2));
+        }
+      } catch {
+        if (!cancelled) setQuote(null);
+      } finally {
+        if (!cancelled) setQuoteLoading(false);
+      }
+    }, 400);
+    return () => { cancelled = true; clearTimeout(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quoteKey]);
 
   // Fetch option expiries from SnapTrade when (symbol, account) change.
   // Debounced 500ms so typing "AAPL" doesn't fire 4 requests.
@@ -638,6 +681,31 @@ export default function TradePanelPage() {
         </button>
       </div>
 
+      {/* ── Live quote (bid / ask / mid) — advisory ────────────────────── */}
+      {quoteKey && (quoteLoading || quote) && (
+        <div className="pt-4 border-t" style={{ borderColor: "var(--border)" }}>
+          <div className="flex items-center justify-between">
+            <div className="text-xs uppercase tracking-wider" style={{ color: "var(--muted)" }}>Quote</div>
+            {quoteLoading && <Spinner />}
+          </div>
+          {quote && quote.available ? (
+            <div className="flex items-center gap-3 mt-2 text-sm">
+              {(["bid", "ask", "mid"] as const).map(k => (
+                <div key={k} className="flex flex-col">
+                  <span className="text-[10px] uppercase tracking-wider" style={{ color: "var(--muted)" }}>{k}</span>
+                  <span className="num font-medium" style={{ color: k === "mid" ? "var(--accent)" : "var(--text)" }}>
+                    {quote[k] != null ? quote[k]!.toFixed(2) : "—"}
+                  </span>
+                </div>
+              ))}
+              <span className="text-[10px] ml-auto" style={{ color: "var(--muted)" }}>advisory · may be delayed</span>
+            </div>
+          ) : quote && !quote.available ? (
+            <div className="text-xs mt-2" style={{ color: "var(--muted)" }}>No quote available (connect an Alpaca account with market-data access).</div>
+          ) : null}
+        </div>
+      )}
+
       {/* ── Custom order (limit / stop / stop-limit) ───────────────────── */}
       <div className="pt-4 border-t" style={{ borderColor: "var(--border)" }}>
         <div className="text-xs uppercase tracking-wider mb-3" style={{ color: "var(--muted)" }}>
@@ -670,6 +738,21 @@ export default function TradePanelPage() {
           {(orderType === "limit" || orderType === "stop_limit") && (
             <div>
               <Label>Limit price</Label>
+              {quote && quote.available && (
+                <div className="flex items-center gap-1.5 mb-1.5">
+                  {(["bid", "mid", "ask"] as const).map(k => quote[k] != null && (
+                    <button
+                      type="button" key={k}
+                      onClick={() => setLimit(quote[k]!.toFixed(2))}
+                      title={`Set limit to ${k}`}
+                      className="px-2 py-0.5 text-[11px] rounded border num"
+                      style={{ borderColor: "var(--border)", color: k === "mid" ? "var(--accent)" : "var(--muted)" }}
+                    >
+                      {k.toUpperCase()} {quote[k]!.toFixed(2)}
+                    </button>
+                  ))}
+                </div>
+              )}
               <input
                 type="number" step="0.01" min="0.01"
                 className="w-full p-2 rounded bg-transparent border" style={inputStyle}
