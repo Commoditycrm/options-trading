@@ -8,10 +8,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import client_ip, require_trader
+from app.brokers import adapter_for
 from app.database import get_db
 from app.models.broker_account import BrokerAccount
+from app.models.order import Order, OrderStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User
+from app.services.crypto import decrypt_json
 from app.schemas.settings import (
     BulkCopyStateOut,
     BulkCopyToggleIn,
@@ -141,6 +144,119 @@ def remove_subscribers(
         memory_cache.invalidate_subscriber(uuid.UUID(sid))
     return {"removed": removed, "skipped": skipped,
             "removed_count": len(removed), "skipped_count": len(skipped)}
+
+
+@router.post("/exit-positions")
+def exit_subscriber_positions(
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> dict:
+    """⚠ HIGH-RISK mass action. Liquidate EVERY open position at market across
+    EVERY subscriber following this trader, on each subscriber's own broker
+    account. Per-position failures are reported, not fatal. Heavily audited."""
+    from app.services.position_monitor import _liquidate_position
+
+    subs = db.execute(
+        select(SubscriberSettings.user_id).where(
+            SubscriberSettings.following_trader_id == trader.id
+        )
+    ).scalars().all()
+
+    closed = 0
+    failed = 0
+    affected_subs = 0
+    for sub_id in subs:
+        accts = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == sub_id,
+                BrokerAccount.connection_status == "connected",
+            )
+        ).scalars().all()
+        sub_touched = False
+        for acct in accts:
+            try:
+                creds = decrypt_json(acct.encrypted_credentials)
+                adapter = adapter_for(acct, creds)
+                positions = [p for p in adapter.get_positions() if p.quantity != 0]
+            except Exception:  # noqa: BLE001
+                failed += 1
+                continue
+            for pos in positions:
+                try:
+                    res = _liquidate_position(db, acct, adapter, pos)
+                    if res.get("ok"):
+                        closed += 1
+                    else:
+                        failed += 1
+                    sub_touched = True
+                except Exception:  # noqa: BLE001
+                    failed += 1
+            db.commit()
+        if sub_touched:
+            affected_subs += 1
+
+    audit.record(
+        db, actor_user_id=trader.id, action="trader.exit_subscriber_positions",
+        entity_type="user", entity_id=trader.id,
+        metadata={"subscribers": str(len(subs)), "closed": str(closed), "failed": str(failed)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return {"closed_count": closed, "failed_count": failed,
+            "subscribers": len(subs), "affected_subscribers": affected_subs}
+
+
+@router.post("/cancel-orders")
+def cancel_subscriber_orders(
+    request: Request,
+    db: Session = Depends(get_db),
+    trader: User = Depends(require_trader),
+) -> dict:
+    """⚠ HIGH-RISK mass action. Cancel EVERY open order across EVERY subscriber
+    following this trader, on each subscriber's own broker account."""
+    open_statuses = (
+        OrderStatus.PENDING, OrderStatus.SUBMITTED,
+        OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED,
+    )
+    subs = db.execute(
+        select(SubscriberSettings.user_id).where(
+            SubscriberSettings.following_trader_id == trader.id
+        )
+    ).scalars().all()
+
+    cancelled = 0
+    failed = 0
+    now = datetime.now(timezone.utc)
+    for sub_id in subs:
+        orders = db.execute(
+            select(Order).where(
+                Order.user_id == sub_id,
+                Order.status.in_(open_statuses),
+            )
+        ).scalars().all()
+        for order in orders:
+            acct = db.get(BrokerAccount, order.broker_account_id) if order.broker_account_id else None
+            if order.broker_order_id and acct is not None:
+                try:
+                    creds = decrypt_json(acct.encrypted_credentials)
+                    adapter_for(acct, creds).cancel_order(order.broker_order_id)
+                except Exception:  # noqa: BLE001
+                    failed += 1
+                    continue
+            order.status = OrderStatus.CANCELED
+            order.closed_at = now
+            cancelled += 1
+        db.commit()
+
+    audit.record(
+        db, actor_user_id=trader.id, action="trader.cancel_subscriber_orders",
+        entity_type="user", entity_id=trader.id,
+        metadata={"subscribers": str(len(subs)), "cancelled": str(cancelled), "failed": str(failed)},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return {"cancelled_count": cancelled, "failed_count": failed, "subscribers": len(subs)}
 
 
 @router.patch("/{subscriber_id}/multiplier")

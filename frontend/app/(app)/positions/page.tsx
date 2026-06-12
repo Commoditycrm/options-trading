@@ -16,6 +16,11 @@ export default function PositionsPage() {
   const [exitModalOpen, setExitModalOpen] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [cancelModalOpen, setCancelModalOpen] = useState(false);
+  // Trader-only subscriber mass-actions (high-risk).
+  const [subExitBusy, setSubExitBusy] = useState(false);
+  const [subExitModalOpen, setSubExitModalOpen] = useState(false);
+  const [subCancelBusy, setSubCancelBusy] = useState(false);
+  const [subCancelModalOpen, setSubCancelModalOpen] = useState(false);
 
   useEffect(() => {
     api<User>("/api/auth/me").then(setUser).catch(() => {});
@@ -67,6 +72,46 @@ export default function PositionsPage() {
     }
   }
 
+  async function runExitSubs() {
+    setSubExitBusy(true);
+    try {
+      const res = await api<{ closed_count: number; failed_count: number; affected_subscribers: number }>(
+        "/api/subscribers/exit-positions",
+        { method: "POST" },
+      );
+      if (res.closed_count === 0 && res.failed_count === 0) {
+        notify.info("No subscriber positions to close.");
+      } else {
+        notify.success(`Closed ${res.closed_count} subscriber position${res.closed_count === 1 ? "" : "s"} across ${res.affected_subscribers} account-holder(s)${res.failed_count ? ` — ${res.failed_count} failed` : ""}`);
+      }
+      setSubExitModalOpen(false);
+    } catch (e) {
+      notify.fromError(e, "Exit subscribers' positions failed");
+    } finally {
+      setSubExitBusy(false);
+    }
+  }
+
+  async function runCancelSubs() {
+    setSubCancelBusy(true);
+    try {
+      const res = await api<{ cancelled_count: number; failed_count: number }>(
+        "/api/subscribers/cancel-orders",
+        { method: "POST" },
+      );
+      if (res.cancelled_count === 0 && res.failed_count === 0) {
+        notify.info("No subscriber orders to cancel.");
+      } else {
+        notify.success(`Cancelled ${res.cancelled_count} subscriber order${res.cancelled_count === 1 ? "" : "s"}${res.failed_count ? ` — ${res.failed_count} failed` : ""}`);
+      }
+      setSubCancelModalOpen(false);
+    } catch (e) {
+      notify.fromError(e, "Cancel subscribers' orders failed");
+    } finally {
+      setSubCancelBusy(false);
+    }
+  }
+
   const isTrader = user?.role === "trader";
 
   return (
@@ -94,6 +139,31 @@ export default function PositionsPage() {
             <span>Exit All</span>
             {exitBusy && <Spinner />}
           </button>
+          {isTrader && (
+            <>
+              <span className="mx-1 self-stretch w-px" style={{ background: "var(--border)" }} aria-hidden />
+              <button
+                type="button"
+                onClick={() => setSubCancelModalOpen(true)}
+                disabled={subCancelBusy}
+                title="Cancel every open order across ALL your subscribers' accounts"
+                className="btn-danger-soft px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
+              >
+                <span>Cancel Subs&rsquo; Orders</span>
+                {subCancelBusy && <Spinner />}
+              </button>
+              <button
+                type="button"
+                onClick={() => setSubExitModalOpen(true)}
+                disabled={subExitBusy}
+                title="Liquidate every open position across ALL your subscribers' accounts"
+                className="btn-danger-soft px-3 py-2 text-sm font-medium inline-flex items-center gap-2"
+              >
+                <span>Exit Subs&rsquo; Positions</span>
+                {subExitBusy && <Spinner />}
+              </button>
+            </>
+          )}
         </div>
       </div>
       <OpenPositionsTable ref={tableRef} />
@@ -135,6 +205,32 @@ export default function PositionsPage() {
         onConfirm={runCancelOpen}
         onCancel={() => setCancelModalOpen(false)}
       />
+
+      {/* Trader high-risk mass actions over SUBSCRIBERS' accounts. */}
+      {isTrader && (
+        <>
+          <ConfirmModal
+            open={subExitModalOpen}
+            title="Exit ALL subscribers' positions?"
+            message="⚠ This liquidates every open position at market across EVERY subscriber's own broker account — not just yours. This affects other people's money and cannot be undone."
+            confirmLabel="Liquidate subscriber positions"
+            variant="danger"
+            busy={subExitBusy}
+            onConfirm={runExitSubs}
+            onCancel={() => setSubExitModalOpen(false)}
+          />
+          <ConfirmModal
+            open={subCancelModalOpen}
+            title="Cancel ALL subscribers' open orders?"
+            message="⚠ This cancels every open (unfilled) order across EVERY subscriber's own broker account — not just yours."
+            confirmLabel="Cancel subscriber orders"
+            variant="danger"
+            busy={subCancelBusy}
+            onConfirm={runCancelSubs}
+            onCancel={() => setSubCancelModalOpen(false)}
+          />
+        </>
+      )}
     </div>
   );
 }
