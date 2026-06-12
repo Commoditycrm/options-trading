@@ -373,12 +373,15 @@ def poll_loop(shutdown_check=None) -> None:
                 # Poll EVERY connected trader Alpaca account. External orders
                 # are recorded for the trader's own visibility regardless of
                 # settings; fan-out is separately gated on mirror_external_trades
-                # inside _poll_one_account. (Join to TraderSettings limits this
-                # to traders — subscribers have no TraderSettings row.)
+                # inside _poll_one_account. Gate on User.role (NOT a join to
+                # TraderSettings): a trader promoted via admin role-change may
+                # lack a TraderSettings row, and an inner join would silently
+                # drop them from polling so their Alpaca trades never reflect.
                 account_ids = list(db.execute(
                     select(BrokerAccount.id).join(
-                        TraderSettings, TraderSettings.user_id == BrokerAccount.user_id,
+                        User, User.id == BrokerAccount.user_id,
                     ).where(
+                        User.role == UserRole.TRADER,
                         BrokerAccount.broker == BrokerName.ALPACA,
                         BrokerAccount.connection_status == "connected",
                     )

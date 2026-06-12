@@ -33,7 +33,7 @@ from app.api.deps import require_admin
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import Order
-from app.models.settings import SubscriberSettings
+from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services.crypto import encrypt_json
 
@@ -209,9 +209,29 @@ def change_role(
     if user.id == admin.id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="cannot_change_own_role")
     user.role = UserRole(payload.role)
+    # Registration creates the role's settings row, but a role CHANGE here must
+    # too — otherwise a promoted trader has no TraderSettings row and the
+    # external_trade_poller (which joins TraderSettings) silently never polls
+    # their broker, so their Alpaca trades never reflect. Idempotent: only
+    # create the row if missing.
+    _ensure_role_settings(db, user)
     db.commit()
     log.info("admin changed role of %s to %s", user.email, payload.role)
     return {"ok": True, "user_id": str(user_id), "role": payload.role}
+
+
+def _ensure_role_settings(db: Session, user: User) -> None:
+    """Create the settings row matching the user's current role if it doesn't
+    already exist. Mirrors the rows auth.register creates. Leaves any existing
+    row for the previous role in place (harmless)."""
+    if user.role == UserRole.TRADER:
+        if db.get(TraderSettings, user.id) is None:
+            db.add(TraderSettings(user_id=user.id, trading_enabled=True))
+    elif user.role == UserRole.SUBSCRIBER:
+        if db.get(SubscriberSettings, user.id) is None:
+            db.add(SubscriberSettings(
+                user_id=user.id, copy_enabled=False, multiplier=Decimal("1.000"),
+            ))
 
 
 # ─── Load-test subscriber management ─────────────────────────────────────────
