@@ -607,6 +607,13 @@ def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
 
     # Single batch insert. Postgres can chew through 100 rows in ~5ms.
     db.execute(PendingCopy.__table__.insert(), rows)
+    # Wake the worker pool immediately via LISTEN/NOTIFY instead of letting them
+    # discover the rows on their next poll tick. Delivered on COMMIT, so the
+    # workers see the committed rows the instant they wake. (Workers also keep a
+    # short fallback poll, so a missed NOTIFY only costs a little latency, never
+    # correctness.)
+    from sqlalchemy import text as _text
+    db.execute(_text("NOTIFY pending_copies"))
     db.commit()
     return len(rows)
 

@@ -12,6 +12,8 @@ interface PendingRow {
   picked_up_at: string | null;
   submitted_at: string | null;
   queue_to_broker_ms: number | null;
+  pickup_ms: number | null;
+  platform_ms: number | null;
   detail: string | null;
 }
 
@@ -107,6 +109,7 @@ export default function QueueDemoPage() {
           <div className="flex text-xs text-zinc-500">
             <div className="w-48 shrink-0">subscriber</div>
             <div className="flex-1">queued → picked_up → submitted ({Math.round(span)} ms span)</div>
+            <div className="w-20 text-right">platform</div>
             <div className="w-24 text-right">q→broker</div>
             <div className="w-24 text-right">status</div>
           </div>
@@ -127,6 +130,11 @@ export default function QueueDemoPage() {
                        style={{ left: `${qPct}%`, width: `${queueWaitPct}%` }} />
                   <div className={`absolute h-full ${r.status === "submitted" ? "bg-emerald-500" : r.status === "failed" ? "bg-red-500" : "bg-amber-500"}`}
                        style={{ left: `${qPct + queueWaitPct}%`, width: `${brokerPct}%` }} />
+                </div>
+                <div className="w-20 text-right text-xs font-mono"
+                     style={{ color: r.platform_ms == null ? undefined : r.platform_ms <= 50 ? "var(--good)" : r.platform_ms <= 150 ? "var(--accent)" : "var(--bad)" }}
+                     title="Platform overhead = our processing only (excludes the broker round-trip)">
+                  {r.platform_ms !== null ? `${r.platform_ms} ms` : "—"}
                 </div>
                 <div className="w-24 text-right text-xs font-mono">
                   {r.queue_to_broker_ms !== null ? `${r.queue_to_broker_ms} ms` : "—"}

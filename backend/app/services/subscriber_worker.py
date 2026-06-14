@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -38,7 +39,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.brokers import BrokerOrderRequest, adapter_for
-from app.database import SessionLocal
+from app.database import SessionLocal, engine
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderStatus
 from app.models.pending_copy import PendingCopy, PendingCopyStatus
@@ -53,13 +54,25 @@ from decimal import Decimal as _D
 log = logging.getLogger(__name__)
 
 DEFAULT_WORKER_COUNT = 100
-# Idle poll interval. Each idle worker runs a SKIP-LOCKED claim query every
-# tick; on a small box, dozens of workers at 25ms hammered the DB pool
-# (~thousands of no-op round-trips/sec with pool_pre_ping) and starved real
-# work — inflating fan-out platform latency. 100ms keeps pickup snappy while
-# cutting idle DB load ~4x. (A LISTEN/NOTIFY wake-up would remove polling
-# entirely — a future improvement.)
-POLL_IDLE_SLEEP_MS = 100
+
+# Postgres NOTIFY channel queue_fanout fires after inserting pending_copies.
+# A dedicated LISTEN thread wakes the worker pool the instant rows land, so
+# pickup latency is ~0 (was up to the poll interval). This is the main lever
+# for keeping *platform* latency under 50ms.
+NOTIFY_CHANNEL = "pending_copies"
+
+# Fallback idle wait. When there's nothing to claim a worker waits on the
+# wake-up event for at most this long, then re-polls anyway. With NOTIFY this
+# path is rarely hit (the event fires first); it's a safety net so a missed
+# notification costs a little latency, never correctness. 250ms also keeps idle
+# DB load LOWER than the old fixed 100ms poll once notifications carry the load.
+POLL_FALLBACK_SEC = 0.25
+
+# Set by the LISTEN thread (cross-thread via loop.call_soon_threadsafe) to wake
+# idle workers. Created in start_workers once the event loop exists.
+_wakeup: asyncio.Event | None = None
+_listener_stop = threading.Event()
+_listener_thread: threading.Thread | None = None
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -97,6 +110,7 @@ def _record_outcome(
     pc: PendingCopy,
     status: PendingCopyStatus,
     detail: str | None = None,
+    broker_ms: int | None = None,
 ) -> None:
     pc.status = status
     pc.detail = detail
@@ -104,8 +118,13 @@ def _record_outcome(
     if status in (PendingCopyStatus.SUBMITTED, PendingCopyStatus.FAILED):
         pc.submitted_at = now
         if pc.picked_up_at is not None:
-            delta_ms = int((now - pc.queued_at).total_seconds() * 1000)
-            pc.queue_to_broker_ms = delta_ms
+            total_ms = int((now - pc.queued_at).total_seconds() * 1000)
+            pc.queue_to_broker_ms = total_ms
+            pc.pickup_ms = int((pc.picked_up_at - pc.queued_at).total_seconds() * 1000)
+            # platform_ms = everything we control = total minus the broker call.
+            # When there was no broker call (skipped/failed before submit), all
+            # of the elapsed time is platform time.
+            pc.platform_ms = max(0, total_ms - broker_ms) if broker_ms is not None else total_ms
     db.commit()
 
 
@@ -415,7 +434,7 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
                 "path": "queue_demo",
             },
         )
-        _record_outcome(db, pc, PendingCopyStatus.SUBMITTED, None)
+        _record_outcome(db, pc, PendingCopyStatus.SUBMITTED, None, broker_ms=child.broker_ms)
         events.publish(entry.user_id, _order_event("order.copy_submitted", child))
         return "submitted"
 
@@ -456,7 +475,17 @@ async def _worker_loop(worker_id: int) -> None:
             # sync and the lock query needs its own connection.
             claimed_id = await loop.run_in_executor(_executor, _claim_one_id)
             if claimed_id is None:
-                await asyncio.sleep(POLL_IDLE_SLEEP_MS / 1000)
+                # Nothing to claim — sleep until the LISTEN thread signals new
+                # rows (instant) or the fallback fires. Clearing AFTER the wait
+                # (and re-claiming at the top of the loop) avoids lost wake-ups.
+                if _wakeup is not None:
+                    try:
+                        await asyncio.wait_for(_wakeup.wait(), timeout=POLL_FALLBACK_SEC)
+                    except asyncio.TimeoutError:
+                        pass
+                    _wakeup.clear()
+                else:
+                    await asyncio.sleep(POLL_FALLBACK_SEC)
                 continue
             outcome = await loop.run_in_executor(_executor, _process_one_sync, claimed_id)
             log.debug("subscriber_worker[%d]: pc=%s outcome=%s",
@@ -478,24 +507,67 @@ def _claim_one_id() -> uuid.UUID | None:
 _workers: list[asyncio.Task] = []
 
 
+def _build_listen_dsn() -> str:
+    # psycopg.connect wants a libpq URL WITHOUT the SQLAlchemy "+psycopg" suffix.
+    return engine.url.set(drivername="postgresql").render_as_string(hide_password=False)
+
+
+def _listen_loop(loop: asyncio.AbstractEventLoop, wakeup: asyncio.Event) -> None:
+    """Dedicated thread: LISTEN on the NOTIFY channel and wake the worker pool
+    the instant queue_fanout signals new rows. Reconnects on failure. Because
+    the workers keep a fallback poll, a listener outage degrades latency, not
+    correctness."""
+    import psycopg
+
+    dsn = _build_listen_dsn()
+    while not _listener_stop.is_set():
+        try:
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(f"LISTEN {NOTIFY_CHANNEL}")
+                log.info("subscriber_worker: LISTEN %s established", NOTIFY_CHANNEL)
+                while not _listener_stop.is_set():
+                    # Block up to 2s for the next notification (re-checking stop
+                    # between waits). stop_after=1 returns on the first one so we
+                    # wake immediately instead of batching for the full window.
+                    if list(conn.notifies(timeout=2.0, stop_after=1)):
+                        loop.call_soon_threadsafe(wakeup.set)
+        except Exception:  # noqa: BLE001
+            if _listener_stop.is_set():
+                break
+            log.exception("subscriber_worker: LISTEN failed; reconnecting in 1s")
+            _listener_stop.wait(1.0)
+    log.info("subscriber_worker: LISTEN thread exiting")
+
+
 async def start_workers(count: int = DEFAULT_WORKER_COUNT) -> None:
     """Launch ``count`` concurrent worker coroutines on the running loop,
     backed by a thread pool sized to ``count`` so all N blocking broker
-    calls run in parallel (not throttled by the default executor)."""
-    global _executor
+    calls run in parallel (not throttled by the default executor). Also starts
+    the LISTEN/NOTIFY wake-up thread so idle workers pick up new rows instantly."""
+    global _executor, _wakeup, _listener_thread
     if _workers:
         log.warning("subscriber_worker: already started (%d), skipping",
                     len(_workers))
         return
+    _wakeup = asyncio.Event()
+    _listener_stop.clear()
+    loop = asyncio.get_running_loop()
+    _listener_thread = threading.Thread(
+        target=_listen_loop, args=(loop, _wakeup),
+        name="subworker-listen", daemon=True,
+    )
+    _listener_thread.start()
     _executor = ThreadPoolExecutor(max_workers=count, thread_name_prefix="subworker")
     for i in range(count):
         _workers.append(asyncio.create_task(_worker_loop(i)))
-    log.info("subscriber_worker: started %d worker(s) (executor max_workers=%d)",
+    log.info("subscriber_worker: started %d worker(s) (executor max_workers=%d) + LISTEN wake-up",
              count, count)
 
 
 async def stop_workers() -> None:
-    global _executor
+    global _executor, _listener_thread
+    _listener_stop.set()  # daemon LISTEN thread unblocks within its 2s window
+    _listener_thread = None
     for t in _workers:
         t.cancel()
     _workers.clear()

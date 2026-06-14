@@ -59,4 +59,11 @@ class PendingCopy(Base):
         DateTime(timezone=True), nullable=True
     )
     queue_to_broker_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Latency split for the "<50ms platform" metric:
+    #   pickup_ms   = queued_at → picked_up_at (how long it waited to be claimed;
+    #                 ~0 with LISTEN/NOTIFY, was up to the poll interval before)
+    #   platform_ms = our processing only = queue_to_broker_ms − broker_ms
+    #                 (the number that must stay < 50ms; broker time is external)
+    pickup_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    platform_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     detail: Mapped[str | None] = mapped_column(String(500), nullable=True)

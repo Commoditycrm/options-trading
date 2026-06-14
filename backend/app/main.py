@@ -237,6 +237,8 @@ def create_app() -> FastAPI:
                     "picked_up_at": r.picked_up_at.isoformat() if r.picked_up_at else None,
                     "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
                     "queue_to_broker_ms": r.queue_to_broker_ms,
+                    "pickup_ms": r.pickup_ms,
+                    "platform_ms": r.platform_ms,
                     "detail": r.detail,
                 } for r in rows],
             }
