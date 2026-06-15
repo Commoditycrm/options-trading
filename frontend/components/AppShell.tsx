@@ -166,6 +166,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // subscribers receive notifications, but the bell is universal so
   // future trader-side notifications work without UI changes).
   const [unreadCount, setUnreadCount] = useState<number>(0);
+  // White-label logo for the current viewer (trader's own, or the logo of the
+  // trader a subscriber follows). null = fall back to the default LogoMark.
+  const [brandLogo, setBrandLogo] = useState<string | null>(null);
   // Broker connection accounts, for the global "Broker live" sidebar badge.
   // null = not loaded yet (badge hidden until we know).
   const [brokers, setBrokers] = useState<BrokerAccount[] | null>(null);
@@ -204,6 +207,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         // copy.retry_failed notifications; the table is generic so
         // future trader-facing notification types will land here too.
         refreshUnreadCount();
+        api<{ logo: string | null }>("/api/settings/my-logo").then(r => setBrandLogo(r.logo)).catch(() => {});
       })
       .catch((e) => {
         if (e instanceof ApiError && e.status === 401) {
@@ -315,9 +319,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           backdropFilter: "blur(8px)",
         }}
       >
-        {/* Logo */}
+        {/* Logo — the trader's white-label logo if set, else the default mark. */}
         <div className="flex items-center gap-3 px-5 pt-6 pb-7">
-          <LogoMark />
+          {brandLogo
+            ? <img src={brandLogo} alt="" style={{ width: 40, height: 40, borderRadius: 8, objectFit: "contain" }} />
+            : <LogoMark />}
           <div className="leading-tight">
             <div style={{ fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>{businessName}</div>
           </div>

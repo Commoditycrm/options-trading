@@ -1,7 +1,7 @@
 import uuid
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.models.settings import RetryInterval
 
@@ -140,6 +140,24 @@ class FollowTraderIn(BaseModel):
 
 class TraderToggleIn(BaseModel):
     trading_enabled: bool
+
+
+class TraderLogoIn(BaseModel):
+    """Per-trader white-label logo as a base64 image data URL (or null to
+    clear). Size-capped so the DB row stays small and uploads stay fast — the
+    frontend resizes before sending."""
+    logo: str | None = None
+
+    @field_validator("logo")
+    @classmethod
+    def _check_logo(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not v.startswith("data:image/"):
+            raise ValueError("logo must be a data:image/... URL")
+        if len(v) > 400_000:  # ~300 KB of base64
+            raise ValueError("logo too large (max ~300KB) — resize it first")
+        return v
 
 
 class TraderMirrorExternalIn(BaseModel):

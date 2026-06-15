@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { ChangeEvent, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { useEventStream } from "@/lib/sse";
@@ -15,10 +15,41 @@ const RETRY_OPTIONS: { value: RetryInterval; label: string }[] = [
   { value: "5m",    label: "Retry after 5 minutes" },
 ];
 
+// Resize an image File down to maxPx on its longest edge and return a data URL.
+// Keeps the upload small (the logo is stored in the DB), PNG first to preserve
+// transparency, falling back to JPEG if still large.
+async function fileToResizedDataUrl(file: File, maxPx = 256): Promise<string> {
+  const src = await new Promise<string>((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result as string);
+    fr.onerror = () => rej(new Error("read failed"));
+    fr.readAsDataURL(file);
+  });
+  const img = await new Promise<HTMLImageElement>((res, rej) => {
+    const i = new Image();
+    i.onload = () => res(i);
+    i.onerror = () => rej(new Error("decode failed"));
+    i.src = src;
+  });
+  const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return src;
+  ctx.drawImage(img, 0, 0, w, h);
+  let out = canvas.toDataURL("image/png");
+  if (out.length > 300_000) out = canvas.toDataURL("image/jpeg", 0.85);
+  return out;
+}
+
 export default function SettingsPage() {
   const [user, setUser] = useState<User | null>(null);
   const [sub, setSub] = useState<SubscriberSettings | null>(null);
   const [trd, setTrd] = useState<TraderSettings | null>(null);
+  const [logo, setLogo] = useState<string | null>(null);
+  const [logoBusy, setLogoBusy] = useState(false);
   const [traders, setTraders] = useState<{ id: string; display_name: string | null; email: string }[]>([]);
   const [multInput, setMultInput] = useState("");
   const [multBusy, setMultBusy] = useState(false);
@@ -46,6 +77,7 @@ export default function SettingsPage() {
         setTraders(await api("/api/settings/traders"));
       } else {
         setTrd(await api<TraderSettings>("/api/settings/trader"));
+        api<{ logo: string | null }>("/api/settings/my-logo").then(r => setLogo(r.logo)).catch(() => {});
       }
     })().catch(e => notify.fromError(e, "Could not load settings"));
   }, []);
@@ -221,6 +253,40 @@ export default function SettingsPage() {
       );
     } catch (e) {
       notify.fromError(e, "Could not change external-trade mirroring");
+    }
+  }
+
+  async function onLogoFile(e: ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";  // allow re-selecting the same file later
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { notify.warn("Please choose an image file"); return; }
+    setLogoBusy(true);
+    try {
+      const dataUrl = await fileToResizedDataUrl(file);
+      if (dataUrl.length > 400_000) {
+        notify.warn("Image is too large even after resizing — try a simpler one");
+        return;
+      }
+      await api("/api/settings/trader/logo", { method: "PATCH", body: JSON.stringify({ logo: dataUrl }) });
+      setLogo(dataUrl);
+      notify.success("Logo updated — your subscribers will see it");
+    } catch (err) {
+      notify.fromError(err, "Could not update logo");
+    } finally {
+      setLogoBusy(false);
+    }
+  }
+  async function removeLogo() {
+    setLogoBusy(true);
+    try {
+      await api("/api/settings/trader/logo", { method: "PATCH", body: JSON.stringify({ logo: null }) });
+      setLogo(null);
+      notify.success("Logo removed");
+    } catch (err) {
+      notify.fromError(err, "Could not remove logo");
+    } finally {
+      setLogoBusy(false);
     }
   }
 
@@ -661,6 +727,33 @@ export default function SettingsPage() {
 
       {user.role === "trader" && trd && (
         <>
+        <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
+          <h2 className="font-medium">Your logo</h2>
+          <p className="text-sm" style={{color: "var(--muted)"}}>
+            Shown to your subscribers in their sidebar. PNG or JPG — it&rsquo;s resized
+            automatically. Leave empty to use the default brand.
+          </p>
+          <div className="flex items-center gap-4">
+            <div className="grid place-items-center rounded shrink-0" style={{width: 64, height: 64, border: "1px solid var(--border)", background: "rgba(255,255,255,0.03)", overflow: "hidden"}}>
+              {logo
+                ? <img src={logo} alt="Your logo" style={{maxWidth: "100%", maxHeight: "100%", objectFit: "contain"}} />
+                : <span style={{color: "var(--muted)", fontSize: 11}}>none</span>}
+            </div>
+            <label className="px-3 py-2 rounded border cursor-pointer text-sm inline-flex items-center gap-2" style={{borderColor: "var(--border)"}}>
+              <span>{logo ? "Replace" : "Upload"} logo</span>
+              {logoBusy && <Spinner />}
+              <input type="file" accept="image/*" className="hidden" onChange={onLogoFile} disabled={logoBusy} />
+            </label>
+            {logo && (
+              <button onClick={removeLogo} disabled={logoBusy}
+                className="px-3 py-2 text-sm rounded border"
+                style={{borderColor: "var(--border)", color: "var(--muted)"}}>
+                Remove
+              </button>
+            )}
+          </div>
+        </section>
+
         <section className="p-4 rounded border space-y-3" style={{borderColor: "var(--border)", background: "var(--panel)"}}>
           <div className="flex items-center justify-between">
             <div>

@@ -23,6 +23,7 @@ from app.schemas.settings import (
     SubscriberToggleIn,
     TakeProfitPctIn,
     TraderDefaultBrokerIn,
+    TraderLogoIn,
     TraderMirrorExternalIn,
     TraderMirrorOnlyFilledIn,
     TraderSettingsOut,
@@ -595,6 +596,49 @@ def set_stop_loss(
     memory_cache.invalidate_subscriber(user.id)
     db.refresh(s)
     return _sub_out(s, db)
+
+
+@router.patch("/trader/logo")
+def set_trader_logo(
+    payload: TraderLogoIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> dict:
+    """Set (or clear) the trader's white-label logo. Subscribers following this
+    trader see it in their sidebar. Stored as a base64 data URL in the DB."""
+    s = db.get(TraderSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    s.logo = payload.logo
+    audit.record(
+        db, actor_user_id=user.id, action="trader.logo_changed",
+        entity_type="trader_settings", entity_id=user.id,
+        # Never store the blob in the audit log — just whether one is set + size.
+        metadata={"has_logo": payload.logo is not None,
+                  "bytes": len(payload.logo) if payload.logo else 0},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return {"ok": True, "has_logo": payload.logo is not None}
+
+
+@router.get("/my-logo")
+def get_my_logo(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict:
+    """Effective white-label logo for the current viewer: a trader sees their
+    own; a subscriber sees the logo of the trader they follow; otherwise null."""
+    if user.role == UserRole.TRADER:
+        ts = db.get(TraderSettings, user.id)
+        return {"logo": ts.logo if ts else None}
+    if user.role == UserRole.SUBSCRIBER:
+        ss = db.get(SubscriberSettings, user.id)
+        if ss and ss.following_trader_id:
+            ts = db.get(TraderSettings, ss.following_trader_id)
+            return {"logo": ts.logo if ts else None}
+    return {"logo": None}
 
 
 @router.get("/traders", response_model=list[dict])

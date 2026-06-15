@@ -58,6 +58,12 @@ class TraderSettings(Base, TimestampMixin):
         nullable=True,
     )
 
+    # White-label logo the trader's subscribers see — a base64 data URL stored
+    # in the DB (the box's disk is wiped on each deploy; Postgres persists).
+    # DEFERRED so the fan-out hot path (queue_fanout loads TraderSettings) never
+    # pulls this potentially-large blob; it's fetched only when explicitly read.
+    logo: Mapped[str | None] = mapped_column(Text, nullable=True, deferred=True)
+
     user = relationship("User", back_populates="trader_settings")
 
 
