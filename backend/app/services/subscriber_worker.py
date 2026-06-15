@@ -453,12 +453,15 @@ _LAST_HEARTBEAT: dict[str, Any] = {"at": None}
 def heartbeat_status() -> dict[str, Any]:
     last = _LAST_HEARTBEAT.get("at")
     if last is None:
-        return {"running": False, "last_run_at": None}
+        return {"running": False, "last_run_at": None, "worker_count": len(_workers)}
     delta = (datetime.now(timezone.utc) - last).total_seconds()
     return {
         "running": True,
         "last_run_at": last.isoformat(),
         "seconds_since": round(delta, 1),
+        # How many fan-out workers are actually running — confirms the
+        # QUEUE_DEMO_WORKER_COUNT change took effect (50, not the old 16).
+        "worker_count": len(_workers),
         "healthy": delta < 60,
     }
 
