@@ -204,6 +204,39 @@ def create_app() -> FastAPI:
             return
         await subscriber_worker.start_workers(count=count)
 
+    @app.on_event("startup")
+    async def _prewarm_broker_clients() -> None:
+        # Warm the cached broker HTTP/TLS connections so the FIRST order after a
+        # restart doesn't pay the ~1.5s cold handshake (the cause of the high
+        # "first trade after deploy" times). Best-effort, off the boot path.
+        def _warm() -> int:
+            from sqlalchemy import select as _select
+            from app.database import SessionLocal as _S
+            from app.models.broker_account import BrokerAccount as _BA, BrokerName as _BN
+            from app.brokers import adapter_for as _adapter_for
+            from app.services.crypto import decrypt_json as _decrypt
+            log = logging.getLogger("uvicorn")
+            warmed = 0
+            try:
+                with _S() as db:
+                    accts = db.execute(_select(_BA).where(
+                        _BA.connection_status == "connected",
+                        _BA.broker == _BN.ALPACA,
+                    )).scalars().all()
+                for acct in accts:
+                    try:
+                        adapter = _adapter_for(acct, _decrypt(acct.encrypted_credentials))
+                        adapter.get_balance_snapshot()  # one call warms the pooled TLS conn
+                        warmed += 1
+                    except Exception:  # noqa: BLE001
+                        log.warning("prewarm: failed for broker_account=%s", acct.id)
+            except Exception:  # noqa: BLE001
+                log.exception("prewarm: sweep failed")
+            log.info("prewarm: warmed %d broker client(s)", warmed)
+            return warmed
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _warm)
+
     @app.get("/api/admin/demo/stats")
     def demo_stats(parent_order_id: str | None = None) -> dict:
         # Surfaces the queue-demo timing data for the admin dashboard.

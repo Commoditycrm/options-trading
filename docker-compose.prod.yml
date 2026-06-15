@@ -56,10 +56,12 @@ services:
       CORS_ORIGINS: ${PUBLIC_URL}
       FRONTEND_BASE_URL: ${PUBLIC_URL}
       # In-process queue worker pool. No Redis on this stack.
-      # 16 workers is plenty for this box's scale; 50 idle workers polling the
-      # DB starved the small Lightsail instance and inflated fan-out latency.
-      # Bump on a bigger box (and ideally move to LISTEN/NOTIFY wake-ups).
-      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-16}
+      # Raised 16 -> 50 now that LISTEN/NOTIFY replaced idle polling: idle
+      # workers no longer touch the DB (they wait on the wake-up event at zero
+      # cost), so the thrash that forced 16 is gone. 50 lets all subscribers in
+      # a 50-sub fan-out be claimed in ONE wave instead of queue-waiting for a
+      # free worker — that wait was the bulk of "platform lag".
+      QUEUE_DEMO_WORKER_COUNT: ${QUEUE_DEMO_WORKER_COUNT:-50}
       RUN_FANOUT_WORKER_IN_PROCESS: "false"
       LOG_LEVEL: INFO
     depends_on:
