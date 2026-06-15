@@ -266,6 +266,11 @@ def create_app() -> FastAPI:
             "retry_scheduler": retry_scheduler.heartbeat_status(),
             "position_monitor": position_monitor.heartbeat_status(),
             "external_trade_poller": external_trade_poller.heartbeat_status(),
+            # Fan-out worker pool + the LISTEN/NOTIFY wake-up that drives the
+            # <50ms platform pickup. queue_listener.healthy == instant wake-ups;
+            # if false, workers fall back to the slower poll (still correct).
+            "subscriber_worker": subscriber_worker.heartbeat_status(),
+            "queue_listener": subscriber_worker.listener_status(),
         }
 
     return app

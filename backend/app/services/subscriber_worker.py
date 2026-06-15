@@ -73,6 +73,14 @@ POLL_FALLBACK_SEC = 0.25
 _wakeup: asyncio.Event | None = None
 _listener_stop = threading.Event()
 _listener_thread: threading.Thread | None = None
+# Observability for /api/health — lets us prove the LISTEN wake-up is actually
+# running on the box (vs silently falling back to the 250ms poll).
+_listener_state: dict[str, Any] = {
+    "listening": False,      # LISTEN connection currently established
+    "notifies": 0,           # notifications received since boot
+    "last_notify_at": None,  # datetime of the most recent notification
+    "last_error": None,      # last listener error, for diagnostics
+}
 
 
 def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) -> Decimal:
@@ -524,19 +532,44 @@ def _listen_loop(loop: asyncio.AbstractEventLoop, wakeup: asyncio.Event) -> None
         try:
             with psycopg.connect(dsn, autocommit=True) as conn:
                 conn.execute(f"LISTEN {NOTIFY_CHANNEL}")
+                _listener_state["listening"] = True
+                _listener_state["last_error"] = None
                 log.info("subscriber_worker: LISTEN %s established", NOTIFY_CHANNEL)
                 while not _listener_stop.is_set():
                     # Block up to 2s for the next notification (re-checking stop
                     # between waits). stop_after=1 returns on the first one so we
                     # wake immediately instead of batching for the full window.
                     if list(conn.notifies(timeout=2.0, stop_after=1)):
+                        _listener_state["notifies"] += 1
+                        _listener_state["last_notify_at"] = datetime.now(timezone.utc)
                         loop.call_soon_threadsafe(wakeup.set)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            _listener_state["listening"] = False
             if _listener_stop.is_set():
                 break
+            _listener_state["last_error"] = str(exc)[:200]
             log.exception("subscriber_worker: LISTEN failed; reconnecting in 1s")
             _listener_stop.wait(1.0)
+    _listener_state["listening"] = False
     log.info("subscriber_worker: LISTEN thread exiting")
+
+
+def listener_status() -> dict[str, Any]:
+    """Health-endpoint view of the LISTEN/NOTIFY wake-up. healthy == the thread
+    is alive AND the LISTEN connection is currently established (so pickup is
+    instant). If unhealthy, workers still drain via the POLL_FALLBACK_SEC poll —
+    slower, not broken."""
+    thread_alive = _listener_thread is not None and _listener_thread.is_alive()
+    last = _listener_state["last_notify_at"]
+    return {
+        "thread_alive": thread_alive,
+        "listening": bool(_listener_state["listening"]),
+        "notifies_received": _listener_state["notifies"],
+        "last_notify_at": last.isoformat() if last else None,
+        "fallback_poll_sec": POLL_FALLBACK_SEC,
+        "last_error": _listener_state["last_error"],
+        "healthy": thread_alive and bool(_listener_state["listening"]),
+    }
 
 
 async def start_workers(count: int = DEFAULT_WORKER_COUNT) -> None:
