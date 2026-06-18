@@ -230,6 +230,10 @@ class AlpacaAdapter(BrokerAdapter):
     def cancel_order(self, broker_order_id: str) -> None:
         self._c().cancel_order_by_id(broker_order_id)
 
+    def cancel_all_orders(self) -> None:
+        """Cancel all open orders on the account (releases held quantity)."""
+        self._c().cancel_orders()
+
     # ── positions ─────────────────────────────────────────────────────────
 
     def get_positions(self) -> list[BrokerPosition]:

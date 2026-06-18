@@ -93,6 +93,12 @@ class BrokerAdapter(ABC):
     def cancel_order(self, broker_order_id: str) -> None:
         raise NotImplementedError
 
+    def cancel_all_orders(self) -> None:
+        """Cancel every open order on this account. Default no-op; brokers that
+        support a bulk cancel (Alpaca) override. Used before Exit All so pending
+        orders don't hold quantity and block the close."""
+        return None
+
     def get_positions(self) -> list[BrokerPosition]:
         """List currently held positions at this broker account."""
         raise NotImplementedError

@@ -10,6 +10,7 @@ simulation shows null marks).
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -90,11 +91,32 @@ def exit_all(
     db.add(snapshot)
     db.flush()
 
+    # Build adapters once and cancel each account's open orders FIRST — a
+    # pending order holds quantity ("held_for_orders"), which otherwise makes
+    # the close fail with "insufficient qty available". Then give the broker a
+    # moment to release that quantity before we read positions and close.
+    adapters: dict = {}
+    for acct in accts:
+        try:
+            adapters[acct.id] = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+        except Exception:  # noqa: BLE001
+            adapters[acct.id] = None
+            continue
+        try:
+            adapters[acct.id].cancel_all_orders()
+        except Exception:  # noqa: BLE001
+            pass  # best-effort
+    if any(a is not None for a in adapters.values()):
+        time.sleep(0.6)
+
     closed: list[dict] = []
     failed: list[dict] = []
     for acct in accts:
+        adapter = adapters.get(acct.id)
+        if adapter is None:
+            failed.append({"broker_account_id": str(acct.id), "error": "adapter_unavailable"})
+            continue
         try:
-            adapter = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
             positions = [p for p in adapter.get_positions() if p.quantity != 0]
         except Exception as exc:  # noqa: BLE001
             failed.append({"broker_account_id": str(acct.id), "error": str(exc)[:200]})
