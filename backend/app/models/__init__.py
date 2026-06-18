@@ -7,6 +7,7 @@ from app.models.order import Fill, InstrumentType, Order, OrderSide, OrderStatus
 from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.position_rule import PositionRule, PositionRuleStatus
 from app.models.settings import RetryInterval, SubscriberSettings, TraderSettings
+from app.models.solo import SoloExitItem, SoloExitSnapshot
 from app.models.user import User, UserRole
 from app.models.watchlist import WatchlistItem
 
@@ -28,6 +29,8 @@ __all__ = [
     "PositionRule",
     "PositionRuleStatus",
     "RetryInterval",
+    "SoloExitItem",
+    "SoloExitSnapshot",
     "SubscriberSettings",
     "TraderSettings",
     "User",

@@ -6,6 +6,8 @@ export interface User {
   role: Role;
   display_name: string | null;
   is_active: boolean;
+  /** True only for a trader the admin flagged as solo (no fan-out + solo toolset). */
+  solo_mode?: boolean;
 }
 
 export type BrokerName = "alpaca" | "ibkr" | "webull" | "snaptrade" | "mock";

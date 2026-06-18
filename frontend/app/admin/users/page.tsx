@@ -11,6 +11,7 @@ interface AdminUser {
   display_name: string | null;
   is_active: boolean;
   created_at: string;
+  solo_mode?: boolean;
 }
 
 const ROLE_COLORS: Record<string, { bg: string; color: string }> = {
@@ -63,6 +64,23 @@ export default function AdminUsersPage() {
       );
     } catch (e) {
       notify.fromError(e, "Could not update user");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function toggleSolo(user: AdminUser) {
+    setBusy(user.id);
+    try {
+      const next = !user.solo_mode;
+      await api(`/api/admin/users/${user.id}/solo-mode`, {
+        method: "PATCH",
+        body: JSON.stringify({ solo_mode: next }),
+      });
+      notify.success(`${user.email} ${next ? "set as solo trader" : "unset solo"}`);
+      setUsers(us => us.map(u => u.id === user.id ? { ...u, solo_mode: next } : u));
+    } catch (e) {
+      notify.fromError(e, "Could not update solo mode");
     } finally {
       setBusy(null);
     }
@@ -244,21 +262,39 @@ export default function AdminUsersPage() {
 
                     {/* Actions */}
                     <td className="px-4 py-3">
-                      {u.role !== "admin" && (
-                        <button
-                          disabled={busy === u.id}
-                          onClick={() => toggleActive(u)}
-                          className="text-xs px-3 py-1 rounded-lg transition-colors"
-                          style={{
-                            background: u.is_active ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)",
-                            color:      u.is_active ? "#ef4444"               : "#22c55e",
-                            border:     "1px solid " + (u.is_active ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"),
-                            cursor:     busy === u.id ? "not-allowed" : "pointer",
-                          }}
-                        >
-                          {u.is_active ? "Deactivate" : "Activate"}
-                        </button>
-                      )}
+                      <div className="flex items-center gap-2">
+                        {u.role !== "admin" && (
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => toggleActive(u)}
+                            className="text-xs px-3 py-1 rounded-lg transition-colors"
+                            style={{
+                              background: u.is_active ? "rgba(239,68,68,0.10)" : "rgba(34,197,94,0.10)",
+                              color:      u.is_active ? "#ef4444"               : "#22c55e",
+                              border:     "1px solid " + (u.is_active ? "rgba(239,68,68,0.25)" : "rgba(34,197,94,0.25)"),
+                              cursor:     busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {u.is_active ? "Deactivate" : "Activate"}
+                          </button>
+                        )}
+                        {u.role === "trader" && (
+                          <button
+                            disabled={busy === u.id}
+                            onClick={() => toggleSolo(u)}
+                            title="Solo trader: no fan-out, gets the exit/simulation/re-enter toolset"
+                            className="text-xs px-3 py-1 rounded-lg transition-colors"
+                            style={{
+                              background: u.solo_mode ? "rgba(10,115,168,0.18)" : "transparent",
+                              color:      u.solo_mode ? "var(--accent)" : "var(--muted)",
+                              border:     "1px solid " + (u.solo_mode ? "rgba(10,115,168,0.35)" : "var(--border)"),
+                              cursor:     busy === u.id ? "not-allowed" : "pointer",
+                            }}
+                          >
+                            {u.solo_mode ? "Solo ✓" : "Set Solo"}
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))

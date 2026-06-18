@@ -64,12 +64,17 @@ class UserOut(BaseModel):
     display_name: Optional[str]
     is_active: bool
     created_at: datetime
+    solo_mode: bool = False
 
     model_config = {"from_attributes": True}
 
 
 class RoleChangeIn(BaseModel):
     role: str = Field(pattern="^(trader|subscriber|admin)$")
+
+
+class SoloModeIn(BaseModel):
+    solo_mode: bool
 
 
 class SeedIn(BaseModel):
@@ -158,10 +163,18 @@ def update_config(
 def list_users(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
-) -> list[User]:
-    return list(
-        db.execute(select(User).order_by(User.created_at.desc())).scalars()
-    )
+) -> list[UserOut]:
+    users = list(db.execute(select(User).order_by(User.created_at.desc())).scalars())
+    solo_ids = set(db.execute(
+        select(TraderSettings.user_id).where(TraderSettings.solo_mode.is_(True))
+    ).scalars())
+    return [
+        UserOut(
+            id=u.id, email=u.email, role=u.role.value, display_name=u.display_name,
+            is_active=u.is_active, created_at=u.created_at, solo_mode=u.id in solo_ids,
+        )
+        for u in users
+    ]
 
 
 @router.patch("/users/{user_id}/activate")
@@ -232,6 +245,29 @@ def _ensure_role_settings(db: Session, user: User) -> None:
             db.add(SubscriberSettings(
                 user_id=user.id, copy_enabled=False, multiplier=Decimal("1.000"),
             ))
+
+
+@router.patch("/users/{user_id}/solo-mode")
+def set_solo_mode(
+    user_id: uuid.UUID,
+    payload: SoloModeIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+) -> dict:
+    """Flag/unflag a trader as a solo trader (no fan-out + solo toolset)."""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="user_not_found")
+    if user.role != UserRole.TRADER:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="not_a_trader")
+    ts = db.get(TraderSettings, user_id)
+    if ts is None:
+        ts = TraderSettings(user_id=user_id, trading_enabled=True)
+        db.add(ts)
+    ts.solo_mode = payload.solo_mode
+    db.commit()
+    log.info("admin set solo_mode=%s for %s", payload.solo_mode, user.email)
+    return {"ok": True, "user_id": str(user_id), "solo_mode": payload.solo_mode}
 
 
 # ─── Load-test subscriber management ─────────────────────────────────────────

@@ -44,6 +44,13 @@ class TraderSettings(Base, TimestampMixin):
     # are detected and fanned out. Default OFF.
     mirror_external_trades: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Solo trader: trades only for himself (no subscribers / no fan-out) and gets
+    # the solo exit/simulation/re-enter toolset instead of the copy-trading UI.
+    # Admin-set. Default OFF (a normal copy-trader).
+    solo_mode: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
+
     # Req #3: if True, only FILLED orders are mirrored to subscribers
     # (not open/pending). Default False = mirror immediately on detection.
     mirror_only_filled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

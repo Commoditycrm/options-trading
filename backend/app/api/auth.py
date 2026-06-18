@@ -124,8 +124,15 @@ def refresh(refresh_token: str, db: Session = Depends(get_db)) -> TokenPair:
 
 
 @router.get("/me", response_model=UserOut)
-def me(user: User = Depends(current_user)) -> User:
-    return user
+def me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> UserOut:
+    solo = False
+    if user.role == UserRole.TRADER:
+        ts = db.get(TraderSettings, user.id)
+        solo = bool(ts and ts.solo_mode)
+    return UserOut(
+        id=user.id, email=user.email, role=user.role,
+        display_name=user.display_name, is_active=user.is_active, solo_mode=solo,
+    )
 
 
 # ─── Password reset ───────────────────────────────────────────────────────────

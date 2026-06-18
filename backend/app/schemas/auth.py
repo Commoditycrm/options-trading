@@ -29,6 +29,8 @@ class UserOut(BaseModel):
     role: UserRole
     display_name: str | None
     is_active: bool
+    # True only for a trader the admin flagged as solo (no fan-out + solo toolset).
+    solo_mode: bool = False
 
     model_config = {"from_attributes": True}
 

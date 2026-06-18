@@ -55,6 +55,7 @@ class TraderSettingsOut(BaseModel):
     mirror_external_trades: bool = False
     mirror_only_filled: bool = False
     default_broker_account_id: uuid.UUID | None = None
+    solo_mode: bool = False
 
     model_config = {"from_attributes": True}
 
