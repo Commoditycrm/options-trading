@@ -104,31 +104,32 @@ def exit_all(
             order_type = OrderType.MARKET
             limit_price = None
             exit_ref = None
+            q = _quote(adapter, pos.instrument_type.value, pos.symbol, occ)
             if mode in ("bid", "ask"):
-                q = _quote(adapter, pos.instrument_type.value, pos.symbol, occ)
                 px = q.get(mode)
-                if px is not None:
+                # A 0/None quote means no live data — fall back to MARKET rather
+                # than build an invalid limit (limit_price must be > 0).
+                if px is not None and px > 0:
                     order_type = OrderType.LIMIT
                     limit_price = px
                     exit_ref = px
             if exit_ref is None:
-                # market (or bid/ask with no quote): use mid/last as the sim reference
-                q = _quote(adapter, pos.instrument_type.value, pos.symbol, occ)
-                exit_ref = q.get("mid")
+                m = q.get("mid")
+                exit_ref = m if (m is not None and m > 0) else None
 
-            payload = PlaceOrderIn(
-                instrument_type=pos.instrument_type,
-                symbol=pos.symbol,
-                side=reverse_side,
-                order_type=order_type,
-                quantity=qty,
-                limit_price=limit_price,
-                stop_price=None,
-                option_expiry=pos.option_expiry if is_option else None,
-                option_strike=pos.option_strike if is_option else None,
-                option_right=pos.option_right if is_option else None,
-            )
             try:
+                payload = PlaceOrderIn(
+                    instrument_type=pos.instrument_type,
+                    symbol=pos.symbol,
+                    side=reverse_side,
+                    order_type=order_type,
+                    quantity=qty,
+                    limit_price=limit_price,
+                    stop_price=None,
+                    option_expiry=pos.option_expiry if is_option else None,
+                    option_strike=pos.option_strike if is_option else None,
+                    option_right=pos.option_right if is_option else None,
+                )
                 order = _place_trader_order(
                     db, trader, payload, acct.id, background, request,
                     skip_fanout=True, is_closing=True,
