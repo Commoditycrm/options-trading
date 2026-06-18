@@ -30,7 +30,9 @@ import logging
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
@@ -88,6 +90,62 @@ def _scale_quantity(trader_qty: Decimal, multiplier: Decimal, fractional: bool) 
     if fractional:
         return raw.quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
     return raw.to_integral_value(rounding=ROUND_DOWN)
+
+
+# ── Parent-order snapshot cache ─────────────────────────────────────────────
+# Every pending_copy in one fan-out shares the SAME trader order, but each
+# worker opened its own session and re-fetched it (db.get(Order, ...)) — 100+
+# identical DB round-trips per fan-out, all on the contended pool. The order's
+# fan-out-relevant fields are immutable once placed, so we cache a lightweight
+# snapshot keyed by id: a 100-subscriber fan-out then costs ONE read instead of
+# 100. Bounded + lock-guarded for the multi-threaded executor. No staleness risk
+# (these columns never change after placement).
+@dataclass(frozen=True)
+class _ParentOrder:
+    id: uuid.UUID
+    user_id: uuid.UUID
+    symbol: str
+    instrument_type: Any
+    option_expiry: Any
+    option_strike: Any
+    option_right: Any
+    side: Any
+    order_type: Any
+    quantity: Decimal
+    limit_price: Any
+    stop_price: Any
+    is_closing: bool
+
+
+_PARENT_CACHE: "OrderedDict[uuid.UUID, _ParentOrder]" = OrderedDict()
+_PARENT_CACHE_MAX = 2048
+_PARENT_CACHE_LOCK = threading.Lock()
+
+
+def _get_parent_order(db: Session, order_id: uuid.UUID) -> _ParentOrder | None:
+    """Immutable fan-out fields of the trader's order, cached so a fan-out costs
+    ONE DB read instead of one-per-subscriber."""
+    with _PARENT_CACHE_LOCK:
+        snap = _PARENT_CACHE.get(order_id)
+        if snap is not None:
+            _PARENT_CACHE.move_to_end(order_id)
+            return snap
+    o = db.get(Order, order_id)
+    if o is None:
+        return None
+    snap = _ParentOrder(
+        id=o.id, user_id=o.user_id, symbol=o.symbol,
+        instrument_type=o.instrument_type, option_expiry=o.option_expiry,
+        option_strike=o.option_strike, option_right=o.option_right,
+        side=o.side, order_type=o.order_type, quantity=o.quantity,
+        limit_price=o.limit_price, stop_price=o.stop_price,
+        is_closing=o.is_closing,
+    )
+    with _PARENT_CACHE_LOCK:
+        _PARENT_CACHE[order_id] = snap
+        if len(_PARENT_CACHE) > _PARENT_CACHE_MAX:
+            _PARENT_CACHE.popitem(last=False)
+    return snap
 
 
 def _claim_one(db: Session) -> PendingCopy | None:
@@ -163,7 +221,8 @@ def _process_one_sync(pc_id: uuid.UUID) -> str:
         if pc is None:
             return "vanished"
 
-        trader_order = db.get(Order, pc.parent_order_id)
+        # Cached snapshot: one DB read per fan-out instead of one per copy.
+        trader_order = _get_parent_order(db, pc.parent_order_id)
         if trader_order is None:
             _record_outcome(db, pc, PendingCopyStatus.FAILED, "parent_order_missing")
             return "parent_missing"
