@@ -10,10 +10,11 @@ simulation shows null marks).
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import require_trader
@@ -75,6 +76,15 @@ def exit_all(
             BrokerAccount.connection_status == "connected",
         )
     ).scalars().all()
+
+    # Only ONE exit snapshot is the active simulation at a time. Close any prior
+    # open snapshot so a fresh Exit All supersedes it (and Re-Enter All then
+    # cleanly clears the table). reentered_at doubles as the "closed" marker.
+    db.execute(
+        update(SoloExitSnapshot)
+        .where(SoloExitSnapshot.user_id == trader.id, SoloExitSnapshot.reentered_at.is_(None))
+        .values(reentered_at=datetime.now(timezone.utc))
+    )
 
     snapshot = SoloExitSnapshot(user_id=trader.id, exit_mode=mode)
     db.add(snapshot)
