@@ -81,6 +81,23 @@ _streams: dict[uuid.UUID, asyncio.Task] = {}
 _RECONNECT_MIN_SECONDS = 5
 _RECONNECT_MAX_SECONDS = 60
 
+# ── Liveness watchdog ───────────────────────────────────────────────────────
+# A TradingStream WebSocket can die SILENTLY (idle drop / half-open TCP) without
+# stream.run() returning OR raising — a "zombie" the reconnect loop never sees,
+# so the account shows "offline" while connection_status is still "connected",
+# and only a MANUAL disconnect+reconnect fixes it. The watchdog stamps last
+# activity per account and force-recycles (the same stop+start a manual reconnect
+# does) any stream silent past _STREAM_MAX_SILENCE_SEC.
+#
+# Trade-off: in a very quiet market a healthy-but-idle stream gets recycled too,
+# but that's harmless — the ~1-2s reconnect gap is covered by the REST
+# external-trade poller, and during active trading the trader's own orders keep
+# the stream's activity fresh. Tune the window if needed.
+_WATCHDOG_INTERVAL_SEC = 30
+_STREAM_MAX_SILENCE_SEC = 240
+_LAST_ACTIVITY: dict[uuid.UUID, float] = {}
+_watchdog_task: Any = None
+
 
 def _dec(v: Any) -> Decimal:
     if v is None or v == "":
@@ -455,6 +472,7 @@ async def _run_stream_for_account(account_id: uuid.UUID) -> None:
             # processing succeeds.
             async def _handler(data: Any) -> None:
                 try:
+                    _LAST_ACTIVITY[account_id] = time.monotonic()  # liveness ping
                     evt = str(getattr(data, "event", "?"))
                     raw = getattr(data, "order", None)
                     sym = str(getattr(raw, "symbol", "?")) if raw is not None else "?"
@@ -480,8 +498,17 @@ async def _run_stream_for_account(account_id: uuid.UUID) -> None:
             # in a "connected but receiving nothing" state with no error.
             # asyncio.to_thread(stream.run) is the SDK's recommended path
             # and is the only one we've confirmed actually delivers events.
+            _LAST_ACTIVITY[account_id] = time.monotonic()  # connected — fresh start
             log.info("alpaca_stream: run loop starting in thread acct=%s", account_id)
-            await asyncio.to_thread(stream.run)
+            try:
+                await asyncio.to_thread(stream.run)
+            finally:
+                # Best-effort: stop the SDK loop so the worker thread exits on
+                # cancel/recycle instead of leaking a zombie thread.
+                try:
+                    stream.stop()
+                except Exception:  # noqa: BLE001
+                    pass
 
             log.info("alpaca_stream: run loop returned cleanly acct=%s, reconnecting", account_id)
             backoff = _RECONNECT_MIN_SECONDS
@@ -545,6 +572,53 @@ def stop_stream(account_id: uuid.UUID) -> None:
         task.cancel()
 
 
+async def _stream_watchdog() -> None:
+    """Force-recycle silently-dead ("zombie") streams that never error.
+
+    The reconnect loop in _run_stream_for_account only fires when stream.run()
+    returns or raises; a half-open WebSocket does neither. We detect it by
+    activity staleness and apply the exact recovery a manual reconnect does
+    (stop_stream + start_stream), so the account self-heals instead of showing
+    offline until a human intervenes."""
+    while True:
+        try:
+            await asyncio.sleep(_WATCHDOG_INTERVAL_SEC)
+            now = time.monotonic()
+            for account_id, fut in list(_streams.items()):
+                if fut.done():
+                    continue
+                idle = now - _LAST_ACTIVITY.get(account_id, now)
+                if idle > _STREAM_MAX_SILENCE_SEC:
+                    log.warning(
+                        "alpaca_stream: watchdog recycling silent stream acct=%s "
+                        "(%.0fs idle) — likely a zombie WebSocket", account_id, idle,
+                    )
+                    # Debounce so the fresh stream isn't immediately re-flagged
+                    # before it has had a chance to receive anything.
+                    _LAST_ACTIVITY[account_id] = now
+                    stop_stream(account_id)
+                    start_stream(account_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("alpaca_stream: watchdog loop error")
+
+
+def start_watchdog() -> None:
+    """Idempotently launch the liveness watchdog on the event-bus loop."""
+    global _watchdog_task
+    if _watchdog_task is not None and not _watchdog_task.done():
+        return
+    from app.services import events as events_bus
+    loop = events_bus._loop
+    if loop is None:
+        log.warning("alpaca_stream: watchdog not started — event loop unbound")
+        return
+    _watchdog_task = asyncio.run_coroutine_threadsafe(_stream_watchdog(), loop)
+    log.info("alpaca_stream: liveness watchdog started "
+             "(interval=%ss, max_silence=%ss)", _WATCHDOG_INTERVAL_SEC, _STREAM_MAX_SILENCE_SEC)
+
+
 async def start_all_streams() -> None:
     """Called at app startup. Queries all currently-connected Alpaca accounts
     and starts a stream for each. Errors per-account are logged, not raised —
@@ -562,11 +636,16 @@ async def start_all_streams() -> None:
         except Exception:  # noqa: BLE001
             log.exception("alpaca_stream: failed to start stream for acct=%s", account_id)
     log.info("alpaca_stream: started %d stream(s)", len(_streams))
+    start_watchdog()
 
 
 async def stop_all_streams() -> None:
     """Called at app shutdown. Cancels every running stream task and waits
     briefly for graceful exit."""
+    global _watchdog_task
+    if _watchdog_task is not None and not _watchdog_task.done():
+        _watchdog_task.cancel()
+    _watchdog_task = None
     tasks = list(_streams.values())
     _streams.clear()
     for t in tasks:
