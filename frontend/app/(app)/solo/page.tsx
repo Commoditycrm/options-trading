@@ -6,7 +6,7 @@ import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
 import { ConfirmModal } from "@/components/ConfirmModal";
 
-type ExitMode = "market" | "bid" | "ask";
+type Mode = "market" | "bid" | "ask";
 
 interface SimItem {
   symbol: string;
@@ -22,7 +22,6 @@ interface SimItem {
 interface Simulation {
   snapshot_id: string | null;
   exit_mode?: string;
-  created_at?: string;
   reentered_at?: string | null;
   items: SimItem[];
   quotes_available?: boolean;
@@ -31,15 +30,21 @@ interface Simulation {
 const fmt = (v: string | null | undefined) =>
   v == null || v === "" ? "—" : Number(v).toLocaleString(undefined, { style: "currency", currency: "USD" });
 
+const MODES: { mode: Mode; label: string }[] = [
+  { mode: "bid", label: "Bid" },
+  { mode: "market", label: "Market" },
+  { mode: "ask", label: "Ask" },
+];
+
 export default function SoloPage() {
   const [sim, setSim] = useState<Simulation | null>(null);
-  const [exitBusy, setExitBusy] = useState<ExitMode | null>(null);
-  const [reenterBusy, setReenterBusy] = useState(false);
-  const [confirm, setConfirm] = useState<ExitMode | "reenter" | null>(null);
+  const [exitBusy, setExitBusy] = useState<Mode | null>(null);
+  const [reenterBusy, setReenterBusy] = useState<Mode | null>(null);
+  const [confirm, setConfirm] = useState<{ action: "exit" | "reenter"; mode: Mode } | null>(null);
 
   const loadSim = useCallback(async () => {
     try { setSim(await api<Simulation>("/api/solo/simulation")); }
-    catch { /* leave last state */ }
+    catch { /* keep last state */ }
   }, []);
 
   useEffect(() => {
@@ -48,7 +53,7 @@ export default function SoloPage() {
     return () => clearInterval(t);
   }, [loadSim]);
 
-  async function exitAll(mode: ExitMode) {
+  async function exitAll(mode: Mode) {
     setExitBusy(mode);
     try {
       const res = await api<{ closed_count: number; failed_count: number }>(
@@ -63,25 +68,21 @@ export default function SoloPage() {
     finally { setExitBusy(null); }
   }
 
-  async function reenterAll() {
-    setReenterBusy(true);
+  async function reenterAll(mode: Mode) {
+    setReenterBusy(mode);
     try {
       const res = await api<{ placed_count: number; failed_count: number }>(
-        "/api/solo/reenter-all", { method: "POST" });
+        `/api/solo/reenter-all?mode=${mode}`, { method: "POST" });
       notify[res.placed_count > 0 ? "success" : "info"](
-        `Re-entered ${res.placed_count} position(s)${res.failed_count ? ` — ${res.failed_count} failed` : ""}`);
+        `Re-entered ${res.placed_count} position(s) @ ${mode}${res.failed_count ? ` — ${res.failed_count} failed` : ""}`);
       setConfirm(null);
       loadSim();
     } catch (e) { notify.fromError(e, "Re-enter failed"); }
-    finally { setReenterBusy(false); }
+    finally { setReenterBusy(null); }
   }
 
   const hasSnapshot = !!sim?.snapshot_id && !sim?.reentered_at;
-  const exitBtns: { mode: ExitMode; label: string }[] = [
-    { mode: "bid", label: "Exit All @ Bid" },
-    { mode: "market", label: "Exit All @ Market" },
-    { mode: "ask", label: "Exit All @ Ask" },
-  ];
+  const busy = exitBusy !== null || reenterBusy !== null;
 
   return (
     <div className="space-y-5 max-w-5xl">
@@ -95,11 +96,11 @@ export default function SoloPage() {
           (and fall back to market if no quote is available).
         </p>
         <div className="flex flex-wrap items-center gap-2">
-          {exitBtns.map(b => (
-            <button key={b.mode} onClick={() => setConfirm(b.mode)} disabled={exitBusy !== null}
+          {MODES.map(m => (
+            <button key={m.mode} onClick={() => setConfirm({ action: "exit", mode: m.mode })} disabled={busy}
               className="btn-danger-soft px-3 py-2 text-sm font-medium inline-flex items-center gap-2">
-              <span>{b.label}</span>
-              {exitBusy === b.mode && <Spinner />}
+              <span>Exit All @ {m.label}</span>
+              {exitBusy === m.mode && <Spinner />}
             </button>
           ))}
         </div>
@@ -116,12 +117,16 @@ export default function SoloPage() {
             </p>
           </div>
           {hasSnapshot && (
-            <button onClick={() => setConfirm("reenter")} disabled={reenterBusy}
-              className="px-4 py-2 rounded font-medium inline-flex items-center gap-2"
-              style={{ background: "var(--accent)", color: "#06121f" }}>
-              <span>Re-Enter All</span>
-              {reenterBusy && <Spinner />}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              {MODES.map(m => (
+                <button key={m.mode} onClick={() => setConfirm({ action: "reenter", mode: m.mode })} disabled={busy}
+                  className="px-3 py-2 rounded text-sm font-medium inline-flex items-center gap-2"
+                  style={{ background: "var(--accent)", color: "#06121f" }}>
+                  <span>Re-Enter @ {m.label}</span>
+                  {reenterBusy === m.mode && <Spinner />}
+                </button>
+              ))}
+            </div>
           )}
         </div>
 
@@ -162,14 +167,14 @@ export default function SoloPage() {
 
       <ConfirmModal
         open={confirm !== null}
-        title={confirm === "reenter" ? "Re-enter all positions?" : `Exit all @ ${confirm}?`}
-        message={confirm === "reenter"
-          ? "This places market orders to rebuild every position from your last exit."
-          : `This closes every open position at ${confirm === "market" ? "market" : `the ${confirm}`}.`}
-        confirmLabel={confirm === "reenter" ? "Re-enter all" : "Exit all"}
-        variant="danger"
-        busy={exitBusy !== null || reenterBusy}
-        onConfirm={() => { if (confirm === "reenter") reenterAll(); else if (confirm) exitAll(confirm); }}
+        title={confirm?.action === "reenter" ? `Re-enter all @ ${confirm.mode}?` : `Exit all @ ${confirm?.mode}?`}
+        message={confirm?.action === "reenter"
+          ? `This rebuilds every position from your last exit at ${confirm.mode === "market" ? "market" : `the ${confirm.mode}`} (original side + qty).`
+          : `This closes every open position at ${confirm?.mode === "market" ? "market" : `the ${confirm?.mode}`}.`}
+        confirmLabel={confirm?.action === "reenter" ? "Re-enter all" : "Exit all"}
+        variant={confirm?.action === "reenter" ? "primary" : "danger"}
+        busy={busy}
+        onConfirm={() => { if (confirm?.action === "reenter") reenterAll(confirm.mode); else if (confirm) exitAll(confirm.mode); }}
         onCancel={() => setConfirm(null)}
       />
     </div>

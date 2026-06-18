@@ -220,16 +220,32 @@ def simulation(db: Session = Depends(get_db), trader: User = Depends(require_tra
 def reenter_all(
     request: Request,
     background: BackgroundTasks,
+    mode: str = Query("market", pattern="^(market|bid|ask)$"),
     db: Session = Depends(get_db),
     trader: User = Depends(require_trader),
 ) -> dict:
-    """Re-open every position from the latest exit snapshot (market orders,
-    original side + qty), then mark the snapshot re-entered."""
-    from datetime import datetime, timezone
+    """Re-open every position from the latest exit snapshot (original side + qty)
+    at the chosen price (market / bid / ask), then mark the snapshot re-entered.
+    Bid/ask place limit orders at the live quote; fall back to market with none."""
+    from app.brokers.alpaca import _parse_occ
 
     snap = _latest_open_snapshot(db, trader.id)
     if snap is None:
         raise HTTPException(404, "no_open_snapshot")
+
+    # Cache one adapter per broker account (for quotes), built lazily.
+    adapters: dict = {}
+    def _adapter(acct_id):
+        if acct_id not in adapters:
+            acct = db.get(BrokerAccount, acct_id)
+            a = None
+            if acct is not None:
+                try:
+                    a = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+                except Exception:  # noqa: BLE001
+                    a = None
+            adapters[acct_id] = a
+        return adapters[acct_id]
 
     placed: list[dict] = []
     failed: list[dict] = []
@@ -237,32 +253,43 @@ def reenter_all(
         is_option = it.instrument_type == "option"
         expiry = strike = right = None
         if is_option and it.occ_symbol:
-            from app.brokers.alpaca import _parse_occ
             parsed = _parse_occ(it.occ_symbol)
             if parsed:
                 _, expiry, strike, right = parsed  # right is OptionRight
-        payload = PlaceOrderIn(
-            instrument_type=InstrumentType(it.instrument_type),
-            symbol=it.symbol,
-            side=OrderSide(it.original_side),
-            order_type=OrderType.MARKET,
-            quantity=it.quantity,
-            limit_price=None,
-            stop_price=None,
-            option_expiry=expiry,
-            option_strike=strike,
-            option_right=right,
-        )
+
+        order_type = OrderType.MARKET
+        limit_price = None
+        if mode in ("bid", "ask"):
+            adapter = _adapter(it.broker_account_id)
+            if adapter is not None:
+                px = _quote(adapter, it.instrument_type, it.symbol, it.occ_symbol).get(mode)
+                if px is not None and px > 0:
+                    order_type = OrderType.LIMIT
+                    limit_price = px
+
         try:
+            payload = PlaceOrderIn(
+                instrument_type=InstrumentType(it.instrument_type),
+                symbol=it.symbol,
+                side=OrderSide(it.original_side),
+                order_type=order_type,
+                quantity=it.quantity,
+                limit_price=limit_price,
+                stop_price=None,
+                option_expiry=expiry,
+                option_strike=strike,
+                option_right=right,
+            )
             order = _place_trader_order(
                 db, trader, payload, it.broker_account_id, background, request,
                 skip_fanout=True, is_closing=False,
             )
-            placed.append({"symbol": it.symbol, "qty": str(it.quantity), "order_id": str(order.id)})
+            placed.append({"symbol": it.symbol, "qty": str(it.quantity), "order_id": str(order.id),
+                           "order_type": order_type.value})
         except Exception as exc:  # noqa: BLE001
             failed.append({"symbol": it.symbol, "error": str(exc)[:200]})
 
     snap.reentered_at = datetime.now(timezone.utc)
     db.commit()
-    return {"snapshot_id": str(snap.id), "placed_count": len(placed),
+    return {"snapshot_id": str(snap.id), "mode": mode, "placed_count": len(placed),
             "failed_count": len(failed), "placed": placed, "failed": failed}
