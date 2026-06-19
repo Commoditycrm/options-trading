@@ -576,6 +576,40 @@ def connect(
         db.commit()
         raise HTTPException(400, f"broker_error: {exc}")
 
+    # Dedupe: connecting an ALREADY-connected account (same broker + same broker
+    # account number) refreshes that row in place instead of inserting a second.
+    # Traders skip eviction (multi-broker support), so without this, re-connecting
+    # the same Alpaca account makes a duplicate row — and positions / solo Exit
+    # All iterate ALL accounts, so the same account would be double-counted.
+    existing = None
+    if acct.broker_account_number:
+        existing = db.execute(
+            select(BrokerAccount).where(
+                BrokerAccount.user_id == user.id,
+                BrokerAccount.broker == payload.broker,
+                BrokerAccount.broker_account_number == acct.broker_account_number,
+            )
+        ).scalars().first()
+    if existing is not None:
+        existing.label = payload.label or existing.label
+        existing.is_paper = acct.is_paper
+        existing.supports_fractional = acct.supports_fractional
+        existing.encrypted_credentials = acct.encrypted_credentials
+        existing.connection_status = "connected"
+        _refresh_balance_into(existing, creds)
+        audit.record(
+            db, actor_user_id=user.id, action="broker.reconnected",
+            entity_type="broker_account", entity_id=existing.id,
+            metadata={"broker": payload.broker.value, "label": payload.label,
+                      "account": existing.broker_account_number, "deduped": True},
+            ip_address=client_ip(request),
+        )
+        db.commit()
+        db.refresh(existing)
+        memory_cache.invalidate_broker_accounts(user.id)
+        _start_trader_listener(user, existing)
+        return existing
+
     db.add(acct)
     db.flush()
     audit.record(
