@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.api.deps import client_ip, current_user, require_trader
 from app.brokers import BrokerOrderRequest, adapter_for
+from app.config import get_settings
 from app.database import SessionLocal, get_db
 from app.models.broker_account import BrokerAccount
 from app.models.order import Order, OrderSide, OrderStatus
@@ -335,6 +336,17 @@ def _submit_to_broker_in_background(
                     db, actor_user_id=actor.id, action="trader.fanout_dispatched",
                     entity_type="order", entity_id=order.id,
                     metadata={"dispatch": "redis_stream", "target_count": count},
+                )
+                db.commit()
+            elif get_settings().fanout_mode == "inproc":
+                # Phase 1 latency rewrite: in-process BATCHED fan-out (one flush,
+                # parallel broker calls, one commit) instead of the per-copy
+                # pending_copies queue. Behind FANOUT_MODE; default stays queue.
+                placed = copy_engine.fanout_inproc(db, order, actor)
+                audit.record(
+                    db, actor_user_id=actor.id, action="trader.fanout_dispatched",
+                    entity_type="order", entity_id=order.id,
+                    metadata={"dispatch": "inproc", "placed": placed},
                 )
                 db.commit()
             else:

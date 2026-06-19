@@ -28,6 +28,8 @@ process_one_fanout that swallows broker errors into a FanoutResult.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -41,18 +43,37 @@ from sqlalchemy.orm import Session
 from app.brokers import BrokerOrderRequest, adapter_for
 from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
-from app.models.order import Order, OrderStatus
+from app.models.order import Order, OrderSide, OrderStatus
 from app.models.pending_copy import PendingCopy, PendingCopyStatus
 from app.models.settings import SubscriberSettings, TraderSettings
 from app.models.user import User, UserRole
 from app.services import audit, events
 from app.services.crypto import decrypt_json
 from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
-from app.services.pnl import today_realized_pnl
+from app.services.pnl import get_account_equity, last_trade_pnl, today_realized_pnl
 
 log = logging.getLogger(__name__)
 
 MAX_PARALLEL = 32
+
+# Per-broker concurrency cap for the batched in-process fan-out. Threads do ONLY
+# the broker HTTP call; this bounds how many simultaneous calls we make to any
+# single broker so a 50-sub fan-out doesn't trip the broker's rate limiter.
+# Sized at MAX_PARALLEL since the ThreadPoolExecutor itself never exceeds that.
+INPROC_BROKER_CONCURRENCY = MAX_PARALLEL
+_BROKER_SEMAPHORES: dict[str, threading.Semaphore] = {}
+_BROKER_SEMAPHORES_LOCK = threading.Lock()
+
+
+def _broker_semaphore(broker_key: str) -> threading.Semaphore:
+    """Lazily create one semaphore per broker type so concurrent fan-outs share
+    the same per-broker concurrency budget."""
+    with _BROKER_SEMAPHORES_LOCK:
+        sem = _BROKER_SEMAPHORES.get(broker_key)
+        if sem is None:
+            sem = threading.Semaphore(INPROC_BROKER_CONCURRENCY)
+            _BROKER_SEMAPHORES[broker_key] = sem
+        return sem
 
 # Grace window for listener-detected orders: an order whose broker-side
 # placement time is older than (broker_account.created_at - this) is treated
@@ -618,6 +639,386 @@ def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
     return len(rows)
 
 
+# ─── In-process BATCHED fan-out (Phase 1 latency rewrite) ───────────────────
+
+
+@dataclass
+class _InprocChild:
+    """One survivor of the gate phase, awaiting its broker call. Carries the
+    SQLAlchemy child Order (touched ONLY on the main thread) plus the immutable
+    request/adapter the worker thread needs (threads never touch the session)."""
+    child: Order
+    user_id: uuid.UUID
+    broker_key: str
+    adapter: Any
+    request: BrokerOrderRequest
+    tp_price: Decimal | None
+    sl_price: Decimal | None
+    parent_order_id: uuid.UUID
+
+
+@dataclass
+class _BrokerOutcome:
+    ok: bool
+    resp: Any | None
+    error_msg: str | None
+    broker_ms: int
+
+
+def _inproc_broker_call(job: _InprocChild) -> _BrokerOutcome:
+    """Runs in a worker thread. Does ONLY the broker round-trip (+ bracket
+    fallback) and returns a plain result. NEVER touches the DB session or the
+    child Order — SQLAlchemy sessions are not thread-safe."""
+    sem = _broker_semaphore(job.broker_key)
+    t0 = time.monotonic()
+    with sem:
+        try:
+            if job.tp_price is not None or job.sl_price is not None:
+                try:
+                    resp = job.adapter.place_bracket_order(
+                        job.request, job.tp_price, job.sl_price
+                    )
+                except NotImplementedError:
+                    log.info(
+                        "fanout_inproc: %s has no bracket support — plain entry "
+                        "fallback for subscriber=%s", job.broker_key, job.user_id,
+                    )
+                    resp = place_order_with_recovery(job.adapter, job.request)
+            else:
+                resp = place_order_with_recovery(job.adapter, job.request)
+        except RecoverableOrderError as exc:
+            return _BrokerOutcome(False, None, exc.friendly_message[:480],
+                                  int((time.monotonic() - t0) * 1000))
+        except Exception as exc:  # noqa: BLE001
+            return _BrokerOutcome(False, None, str(exc)[:480],
+                                  int((time.monotonic() - t0) * 1000))
+    return _BrokerOutcome(True, resp, None, int((time.monotonic() - t0) * 1000))
+
+
+def _inproc_auto_pause(
+    db: Session,
+    user_id: uuid.UUID,
+    reason: str,
+    metadata: dict[str, str],
+    deferred_sse: list[tuple[uuid.UUID, dict[str, Any]]],
+    invalidate: set[uuid.UUID],
+) -> None:
+    """A risk limit tripped: flip copy_enabled off + audit (committed with the
+    batch), and queue the SSE + cache invalidation to fire after the commit.
+    Mirrors subscriber_worker._auto_pause minus the pending_copy bookkeeping."""
+    sub = db.get(SubscriberSettings, user_id)
+    if sub is not None:
+        sub.copy_enabled = False
+    audit.record(
+        db, actor_user_id=user_id, action=f"copy.auto_paused_{reason}",
+        entity_type="subscriber_settings", entity_id=user_id, metadata=metadata,
+    )
+    invalidate.add(user_id)
+    deferred_sse.append((user_id, {"type": "copy.auto_paused", "reason": reason, **metadata}))
+
+
+def fanout_inproc(db: Session, trader_order: Order, trader: User) -> int:
+    """In-process BATCHED fan-out — the Phase-1 replacement for the per-copy
+    ``pending_copies`` commit storm.
+
+    Pipeline:
+      1. Trader master gate (trading_enabled + not copy_paused) — same as
+         queue_fanout. Subscribers come from the in-memory cache.
+      2. Per-sub gates run IN MEMORY (with per-sub DB reads only for P&L /
+         equity, which v1 accepts); survivors get a PENDING child Order built
+         via db.add (NO commit).
+      3. ONE db.flush() assigns every child its id.
+      4. Broker adapters are built on the MAIN thread, then the broker calls
+         run in PARALLEL via a ThreadPoolExecutor + per-broker semaphore. The
+         threads do ONLY the HTTP call and return a plain result — they never
+         touch the session or the child rows.
+      5. The main thread writes each response back onto its child + audit, then
+         does ONE commit.
+      6. SSE events fire per-sub AFTER the commit.
+
+    Each trader's fan-out already runs in its own thread (FastAPI background
+    task), so multiple traders fan out in parallel with no head-of-line block.
+
+    Gate parity source of truth: subscriber_worker._process_one_sync. Returns
+    the number of children submitted to a broker (success or failure), i.e. how
+    many mirror orders were actually attempted.
+    """
+    from app.services import memory_cache
+
+    # ── 1. Trader master gate ─────────────────────────────────────────────
+    if trader.role != UserRole.TRADER:
+        return 0
+    ts = db.get(TraderSettings, trader.id)
+    if ts is None or not ts.trading_enabled or ts.copy_paused:
+        return 0
+
+    subs = memory_cache.subscribers_for_trader(trader.id)
+    if not subs:
+        return 0
+
+    deferred_sse: list[tuple[uuid.UUID, dict[str, Any]]] = []
+    # Child-order SSE — payload built AFTER commit so server-default columns
+    # (created_at) are populated. Each entry: (user_id, child, event_type).
+    child_events: list[tuple[uuid.UUID, Order, str]] = []
+    invalidate: set[uuid.UUID] = set()
+    jobs: list[_InprocChild] = []
+
+    # ── 2. Per-sub gates (in memory) + build PENDING children ─────────────
+    for entry in subs:
+        if not entry.copy_enabled:
+            continue
+        if entry.following_trader_id != trader.id:
+            continue
+
+        # ── Risk gates — any trip auto-pauses copy for the rest of the day.
+        # 1a. Legacy absolute daily-loss kill switch.
+        if entry.daily_loss_limit is not None:
+            todays_pnl = today_realized_pnl(db, entry.user_id)
+            if todays_pnl <= -entry.daily_loss_limit:
+                _inproc_auto_pause(db, entry.user_id, "daily_loss_limit", {
+                    "daily_loss_limit": str(entry.daily_loss_limit),
+                    "todays_realized_pnl": str(todays_pnl),
+                }, deferred_sse, invalidate)
+                continue
+
+        # 1b. Daily loss limit as % of account equity.
+        if entry.daily_loss_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_limit = equity * entry.daily_loss_limit_pct / Decimal(100)
+                todays_pnl = today_realized_pnl(db, entry.user_id)
+                if todays_pnl <= -dollar_limit:
+                    _inproc_auto_pause(db, entry.user_id, "daily_loss_limit_pct", {
+                        "daily_loss_limit_pct": str(entry.daily_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(Decimal("0.01"))),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "account_equity": str(equity),
+                    }, deferred_sse, invalidate)
+                    continue
+
+        # 1b-profit. Daily PROFIT target as % of equity.
+        if entry.daily_profit_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_target = equity * entry.daily_profit_limit_pct / Decimal(100)
+                todays_pnl = today_realized_pnl(db, entry.user_id)
+                if todays_pnl >= dollar_target:
+                    _inproc_auto_pause(db, entry.user_id, "daily_profit_limit", {
+                        "daily_profit_limit_pct": str(entry.daily_profit_limit_pct),
+                        "dollar_target": str(dollar_target.quantize(Decimal("0.01"))),
+                        "todays_realized_pnl": str(todays_pnl),
+                        "account_equity": str(equity),
+                    }, deferred_sse, invalidate)
+                    continue
+
+        # 1c. Per-trade loss limit as % of equity (last closed round-trip).
+        if entry.per_trade_loss_limit_pct is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity:
+                dollar_limit = equity * entry.per_trade_loss_limit_pct / Decimal(100)
+                last_pnl = last_trade_pnl(db, entry.user_id)
+                if last_pnl is not None and last_pnl <= -dollar_limit:
+                    _inproc_auto_pause(db, entry.user_id, "per_trade_loss_limit", {
+                        "per_trade_loss_limit_pct": str(entry.per_trade_loss_limit_pct),
+                        "dollar_limit": str(dollar_limit.quantize(Decimal("0.01"))),
+                        "last_trade_pnl": str(last_pnl),
+                        "account_equity": str(equity),
+                    }, deferred_sse, invalidate)
+                    continue
+
+        # 1d. Max-drawdown protection vs the baseline captured when enabled.
+        if entry.max_drawdown_pct is not None and entry.max_drawdown_equity_baseline is not None:
+            equity = get_account_equity(db, entry.user_id)
+            if equity is not None:
+                min_equity = entry.max_drawdown_equity_baseline * (1 - entry.max_drawdown_pct / Decimal(100))
+                if equity <= min_equity:
+                    _inproc_auto_pause(db, entry.user_id, "max_drawdown", {
+                        "max_drawdown_pct": str(entry.max_drawdown_pct),
+                        "equity_baseline": str(entry.max_drawdown_equity_baseline),
+                        "current_equity": str(equity),
+                        "min_equity_threshold": str(min_equity.quantize(Decimal("0.01"))),
+                    }, deferred_sse, invalidate)
+                    continue
+
+        # Req #6: exclusion list (pure memory).
+        if entry.excluded_symbols and trader_order.symbol.upper() in entry.excluded_symbols:
+            continue
+
+        # Subscriber opted out of mirroring the trader's exits.
+        if trader_order.is_closing and not entry.follow_trader_exits:
+            continue
+
+        # Req #4 Replace mode: skip trader closes when sub manages own TP/SL.
+        if trader_order.is_closing and (entry.take_profit_pct or entry.stop_loss_pct):
+            continue
+
+        if not entry.broker_accounts:
+            continue
+
+        # v1: use the subscriber's first broker account.
+        acct_snapshot = entry.broker_accounts[0]
+        acct = db.get(BrokerAccount, acct_snapshot.id)
+        if acct is None:
+            continue
+
+        scaled = _scale_quantity(
+            trader_order.quantity, entry.multiplier, acct_snapshot.supports_fractional
+        )
+        if scaled <= 0:
+            continue
+
+        child = Order(
+            user_id=entry.user_id,
+            broker_account_id=acct.id,
+            parent_order_id=trader_order.id,
+            instrument_type=trader_order.instrument_type,
+            symbol=trader_order.symbol,
+            option_expiry=trader_order.option_expiry,
+            option_strike=trader_order.option_strike,
+            option_right=trader_order.option_right,
+            side=trader_order.side,
+            order_type=trader_order.order_type,
+            quantity=scaled,
+            limit_price=trader_order.limit_price,
+            stop_price=trader_order.stop_price,
+            status=OrderStatus.PENDING,
+            is_closing=trader_order.is_closing,
+        )
+        db.add(child)
+
+        # Build the broker adapter on the MAIN thread (Phase 1) — threads only
+        # do the HTTP call. A credential failure rejects the child inline.
+        try:
+            creds = decrypt_json(acct.encrypted_credentials)
+            adapter = adapter_for(acct, creds)
+        except Exception as exc:  # noqa: BLE001
+            child.status = OrderStatus.REJECTED
+            child.reject_reason = f"credentials_error: {exc}"[:480]
+            child.closed_at = datetime.now(timezone.utc)
+            db.flush()
+            audit.record(
+                db, actor_user_id=entry.user_id, action="copy.error",
+                entity_type="order", entity_id=child.id,
+                metadata={"parent_order_id": str(trader_order.id),
+                          "error": str(exc)[:300], "path": "inproc"},
+            )
+            child_events.append((entry.user_id, child, "order.copy_failed"))
+            continue
+
+        request = BrokerOrderRequest(
+            instrument_type=child.instrument_type,
+            symbol=child.symbol,
+            side=child.side,
+            order_type=child.order_type,
+            quantity=child.quantity,
+            limit_price=child.limit_price,
+            stop_price=child.stop_price,
+            option_expiry=child.option_expiry,
+            option_strike=child.option_strike,
+            option_right=child.option_right,
+            client_order_id=None,  # set after flush gives the child an id
+        )
+
+        # Req #4: auto TP/SL bracket (Replace mode) — opening orders only.
+        tp_price = None
+        sl_price = None
+        if not trader_order.is_closing and (entry.take_profit_pct or entry.stop_loss_pct):
+            ref_price = trader_order.limit_price or trader_order.stop_price
+            if ref_price is not None and ref_price > 0:
+                direction = Decimal(1) if trader_order.side == OrderSide.BUY else Decimal(-1)
+                if entry.take_profit_pct:
+                    tp_price = (ref_price * (1 + direction * entry.take_profit_pct / Decimal(100))).quantize(Decimal("0.01"))
+                if entry.stop_loss_pct:
+                    sl_price = (ref_price * (1 - direction * entry.stop_loss_pct / Decimal(100))).quantize(Decimal("0.01"))
+
+        jobs.append(_InprocChild(
+            child=child,
+            user_id=entry.user_id,
+            broker_key=acct.broker.value,
+            adapter=adapter,
+            request=request,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            parent_order_id=trader_order.id,
+        ))
+
+    # ── 3. ONE flush for every child (assigns ids) ────────────────────────
+    db.flush()
+    # client_order_id must be the child's own id — fill it now that flush ran.
+    for job in jobs:
+        job.request = BrokerOrderRequest(
+            instrument_type=job.request.instrument_type,
+            symbol=job.request.symbol,
+            side=job.request.side,
+            order_type=job.request.order_type,
+            quantity=job.request.quantity,
+            limit_price=job.request.limit_price,
+            stop_price=job.request.stop_price,
+            option_expiry=job.request.option_expiry,
+            option_strike=job.request.option_strike,
+            option_right=job.request.option_right,
+            client_order_id=str(job.child.id),
+        )
+
+    # ── 4. Parallel broker submit (threads do ONLY the HTTP call) ─────────
+    outcomes: dict[uuid.UUID, _BrokerOutcome] = {}
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(jobs))) as pool:
+            results = list(pool.map(_inproc_broker_call, jobs))
+        for job, outcome in zip(jobs, results):
+            outcomes[job.child.id] = outcome
+
+    # ── 5. Apply responses to children + audit (main thread), ONE commit ──
+    for job in jobs:
+        child = job.child
+        outcome = outcomes[child.id]
+        child.broker_ms = outcome.broker_ms
+        if outcome.ok:
+            resp = outcome.resp
+            child.status = resp.status
+            child.broker_order_id = resp.broker_order_id
+            child.submitted_at = resp.submitted_at
+            child.filled_quantity = resp.filled_quantity
+            child.filled_avg_price = resp.filled_avg_price
+            audit.record(
+                db, actor_user_id=job.user_id, action="copy.submitted",
+                entity_type="order", entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(job.parent_order_id),
+                    "broker_order_id": resp.broker_order_id,
+                    "scaled_qty": str(child.quantity),
+                    "path": "inproc",
+                },
+            )
+            child_events.append((job.user_id, child, "order.copy_submitted"))
+        else:
+            child.status = OrderStatus.REJECTED
+            child.reject_reason = (outcome.error_msg or "broker_error")[:480]
+            child.closed_at = datetime.now(timezone.utc)
+            audit.record(
+                db, actor_user_id=job.user_id, action="copy.error",
+                entity_type="order", entity_id=child.id,
+                metadata={
+                    "parent_order_id": str(job.parent_order_id),
+                    "error": (outcome.error_msg or "")[:300],
+                    "path": "inproc",
+                },
+            )
+            child_events.append((job.user_id, child, "order.copy_failed"))
+
+    db.commit()
+
+    # ── 6. SSE + cache invalidation AFTER the commit ──────────────────────
+    for user_id in invalidate:
+        memory_cache.invalidate_subscriber(user_id)
+    for user_id, payload in deferred_sse:
+        events.publish(user_id, payload)
+    for user_id, child, event_type in child_events:
+        events.publish(user_id, _order_event(event_type, child))
+
+    return len(jobs)
+
+
 def dispatch_detected_order(db: Session, trader_order: Order, trader: User) -> dict[str, Any]:
     """Single dispatch entrypoint for a freshly-detected trader order.
 
@@ -641,6 +1042,12 @@ def dispatch_detected_order(db: Session, trader_order: Order, trader: User) -> d
             return {"dispatch": "skipped_not_filled", "status": trader_order.status.value}
 
     if getattr(get_settings(), "use_queue_fanout", True):
+        # Phase 1: in-process BATCHED fan-out, flipped on via FANOUT_MODE. No
+        # pending_copies / worker pool — children are built, flushed, placed in
+        # parallel and committed here. Default "queue" keeps the existing path.
+        if getattr(get_settings(), "fanout_mode", "queue") == "inproc":
+            placed = fanout_inproc(db, trader_order, trader)
+            return {"dispatch": "inproc", "placed": placed}
         # Commit so the trader Order row is visible to worker sessions before
         # we enqueue pending_copies rows that FK-reference it.
         db.commit()

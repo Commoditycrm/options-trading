@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     # Set False to fall back to the legacy dispatch (for A/B comparison).
     use_queue_fanout: bool = True
 
+    # Fan-out strategy selector for the hot path (trade-panel + external
+    # detection). Phase 1 of the latency rewrite introduces "inproc": an
+    # in-process BATCHED fan-out (copy_engine.fanout_inproc) that builds every
+    # child Order, does ONE flush, fires the broker calls in parallel, then does
+    # ONE commit — collapsing the queue path's ~2-commits-per-copy storm into
+    # two round-trips. Values:
+    #   "queue"  → queue_fanout + pending_copies + async worker pool (DEFAULT;
+    #              keeps the existing path + LISTEN/NOTIFY fallback intact).
+    #   "inproc" → fanout_inproc batched in-process fan-out (flip on the box to
+    #              latency-test; full gate parity with the worker path).
+    # NOTE: when use_queue_fanout=False this is ignored — the legacy serial /
+    # Redis dispatch wins (see dispatch_detected_order). Default keeps queue so
+    # nothing changes until explicitly flipped.
+    fanout_mode: str = "queue"
+
     # Number of worker threads to spawn. Each one runs its own consume_loop
     # against the same Redis Stream Consumer Group, so messages are shared
     # across them — true parallel processing of subscriber broker calls.
