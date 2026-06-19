@@ -124,6 +124,13 @@ export default function SoloPage() {
   );
   const allChecked = positions != null && excluded.size === 0;
 
+  // Total unrealized P&L — all positions vs the checked subset — so the trader
+  // can see what exiting will realize before clicking.
+  const sumUpnl = (ps: Position[]) =>
+    ps.reduce((a, p) => a + (p.unrealized_pnl == null ? 0 : Number(p.unrealized_pnl)), 0);
+  const totalUpnl = useMemo(() => sumUpnl(positions ?? []), [positions]);
+  const selectedUpnl = useMemo(() => sumUpnl(selectedPositions), [selectedPositions]);
+
   async function exitAll(mode: Mode) {
     setExitBusy(mode);
     try {
@@ -255,6 +262,19 @@ export default function SoloPage() {
           </div>
         )}
 
+        {positions != null && positions.length > 0 && (
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm">
+            <span style={{ color: "var(--muted)" }}>
+              Total unrealized P&amp;L:{" "}
+              <strong className="num" style={{ color: totalUpnl >= 0 ? "var(--good)" : "var(--bad)" }}>{fmt(String(totalUpnl))}</strong>
+            </span>
+            <span style={{ color: "var(--muted)" }}>
+              Selected ({exitCount} of {positions.length}):{" "}
+              <strong className="num" style={{ color: selectedUpnl >= 0 ? "var(--good)" : "var(--bad)" }}>{fmt(String(selectedUpnl))}</strong>
+            </span>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2">
           {MODES.map(m => (
             <button key={m.mode} onClick={() => setConfirm({ action: "exit", mode: m.mode })}
@@ -264,11 +284,6 @@ export default function SoloPage() {
               {exitBusy === m.mode && <Spinner />}
             </button>
           ))}
-          {positions != null && positions.length > 0 && (
-            <span className="text-sm" style={{ color: "var(--muted)" }}>
-              {exitCount} of {positions.length} selected
-            </span>
-          )}
         </div>
       </section>
 

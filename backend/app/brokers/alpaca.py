@@ -234,6 +234,29 @@ class AlpacaAdapter(BrokerAdapter):
         """Cancel all open orders on the account (releases held quantity)."""
         self._c().cancel_orders()
 
+    def cancel_open_orders_for_symbols(self, broker_symbols: list[str]) -> int:
+        """Cancel only the OPEN orders whose symbol is in ``broker_symbols``
+        (OCC for options, ticker for stocks). Used by a PARTIAL solo exit to
+        free the held quantity of the positions being closed WITHOUT touching
+        the working orders of positions the trader chose to keep. Returns the
+        number of cancels attempted. Best-effort per order."""
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        want = {s.upper() for s in broker_symbols}
+        if not want:
+            return 0
+        orders = self._c().get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)) or []
+        n = 0
+        for o in orders:
+            if str(getattr(o, "symbol", "") or "").upper() in want:
+                try:
+                    self._c().cancel_order_by_id(o.id)
+                    n += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return n
+
     # ── positions ─────────────────────────────────────────────────────────
 
     def get_positions(self) -> list[BrokerPosition]:

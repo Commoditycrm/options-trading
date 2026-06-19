@@ -130,18 +130,35 @@ def exit_all(
     # On a PARTIAL exit we skip the account-wide cancel so excluded positions'
     # working orders stay untouched (the adapter has no per-symbol cancel).
     adapters: dict = {}
+    did_cancel = False
     for acct in accts:
         try:
             adapters[acct.id] = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
         except Exception:  # noqa: BLE001
             adapters[acct.id] = None
             continue
+        adapter = adapters[acct.id]
         if selected is None:
+            # Full exit: cancel everything on the account.
             try:
-                adapters[acct.id].cancel_all_orders()
+                adapter.cancel_all_orders()
+                did_cancel = True
             except Exception:  # noqa: BLE001
                 pass  # best-effort
-    if selected is None and any(a is not None for a in adapters.values()):
+        else:
+            # Partial exit: cancel only the SELECTED positions' working orders so
+            # their held quantity is freed (otherwise the close rejects with
+            # "insufficient qty / held_for_orders"), while leaving the excluded
+            # positions' orders untouched. Needs a per-symbol cancel (Alpaca).
+            syms = [bsym for (aid, bsym) in selected if aid == acct.id]
+            cancel_fn = getattr(adapter, "cancel_open_orders_for_symbols", None)
+            if syms and callable(cancel_fn):
+                try:
+                    if cancel_fn(syms):
+                        did_cancel = True
+                except Exception:  # noqa: BLE001
+                    pass  # best-effort
+    if did_cancel:
         time.sleep(0.6)
 
     closed: list[dict] = []

@@ -152,6 +152,10 @@ export default function TradePanelPage() {
   const [strike, setStrike] = useState("");
   const [right, setRight] = useState<OptionRight>("call");
   const [submitting, setSubmitting] = useState(false);
+  // Synchronous double-submit guard. `submitting` state only disables the
+  // button on the next render; this ref flips in the same tick so a fast
+  // double-click can't fire two POSTs (which created duplicate orders).
+  const inFlightRef = useRef(false);
   // Optional SL/TP % applied to the resulting position after it fills.
   const [tpPct, setTpPct] = useState("");
   const [slPct, setSlPct] = useState("");
@@ -428,6 +432,10 @@ export default function TradePanelPage() {
     overrideSide?: OrderSide;
     overrideType?: OrderType;
   } = {}) {
+    // Synchronous in-flight lock: `submitting` state only disables the button
+    // on the next render, so a rapid double-click / Enter-then-click fires this
+    // twice in the same tick → two POSTs → two orders. The ref flips now.
+    if (inFlightRef.current) return;
     if (!acctId) { notify.warn("Connect a broker first"); return; }
     if (!symbol.trim()) { notify.warn("Enter a symbol"); return; }
     if (!qty || Number(qty) <= 0) { notify.warn("Enter a quantity"); return; }
@@ -435,6 +443,7 @@ export default function TradePanelPage() {
     const useSide = opts.overrideSide ?? side;
     const useType = opts.overrideType ?? orderType;
 
+    inFlightRef.current = true;
     setSubmitting(true);
     try {
       const body: Record<string, unknown> = {
@@ -484,6 +493,7 @@ export default function TradePanelPage() {
       notify.fromError(e, "Order placement failed");
     } finally {
       setSubmitting(false);
+      inFlightRef.current = false;
     }
   }
 

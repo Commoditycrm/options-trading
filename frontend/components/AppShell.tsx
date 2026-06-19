@@ -202,6 +202,22 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // White-label logo for the current viewer (trader's own, or the logo of the
   // trader a subscriber follows). null = fall back to the default LogoMark.
   const [brandLogo, setBrandLogo] = useState<string | null>(null);
+
+  // Keep the BROWSER-TAB favicon in sync with the white-label logo. The static
+  // metadata favicon (app/layout.tsx → /brand-icon.avif) is the same for every
+  // user and never reflects a trader's uploaded logo; this points the tab icon
+  // at the per-viewer logo (a base64 data URL) once it loads, falling back to
+  // the default. Without this the sidebar updates but the tab icon doesn't.
+  useEffect(() => {
+    const href = brandLogo || "/brand-icon.avif";
+    let link = document.querySelector<HTMLLinkElement>("link[rel~='icon']");
+    if (!link) {
+      link = document.createElement("link");
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    if (link.href !== href) link.href = href;
+  }, [brandLogo]);
   // Broker connection accounts, for the global "Broker live" sidebar badge.
   // null = not loaded yet (badge hidden until we know).
   const [brokers, setBrokers] = useState<BrokerAccount[] | null>(null);
