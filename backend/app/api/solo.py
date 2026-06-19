@@ -27,6 +27,7 @@ from app.brokers.alpaca import build_occ_symbol
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
 from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderType
+from app.models.settings import TraderSettings
 from app.models.solo import SoloExitItem, SoloExitSnapshot
 from app.models.user import User
 from app.schemas.order import PlaceOrderIn
@@ -103,6 +104,11 @@ def exit_all(
     selected: set[tuple[uuid.UUID, str]] | None = None
     if payload is not None and payload.selections is not None:
         selected = {(s.broker_account_id, s.broker_symbol.upper()) for s in payload.selections}
+
+    # Solo auto re-enter: when configured, arm each exited item so the
+    # position_monitor re-enters it on a favorable move from the exit price.
+    ts = db.get(TraderSettings, trader.id)
+    reenter_pct = ts.solo_reenter_pct if ts is not None else None
 
     accts = db.execute(
         select(BrokerAccount).where(
@@ -233,6 +239,9 @@ def exit_all(
                     quantity=qty,
                     entry_price=pos.avg_entry_price,
                     exit_price=exit_ref,
+                    # Arm for auto re-enter only if the trader configured a % and
+                    # we captured an exit reference price to compare against.
+                    auto_reenter_armed=bool(reenter_pct is not None and exit_ref is not None),
                 ))
                 closed.append({"symbol": pos.broker_symbol, "qty": str(qty), "order_id": str(order.id),
                                "order_type": order_type.value, "limit_price": str(limit_price) if limit_price else None})

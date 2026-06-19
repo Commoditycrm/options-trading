@@ -92,6 +92,33 @@ export default function SoloPage() {
   const [reenterBusy, setReenterBusy] = useState<Mode | null>(null);
   const [confirm, setConfirm] = useState<{ action: "exit" | "reenter"; mode: Mode } | null>(null);
 
+  // Auto re-enter % (solo_reenter_pct). "" = off.
+  const [reenterPct, setReenterPct] = useState("");
+  const [savedPct, setSavedPct] = useState("");
+  const [savingPct, setSavingPct] = useState(false);
+
+  const loadSettings = useCallback(async () => {
+    try {
+      const s = await api<{ solo_reenter_pct: string | null }>("/api/settings/trader");
+      const v = s.solo_reenter_pct == null ? "" : String(Number(s.solo_reenter_pct));
+      setReenterPct(v); setSavedPct(v);
+    } catch { /* leave blank */ }
+  }, []);
+
+  async function saveReenterPct() {
+    setSavingPct(true);
+    try {
+      const pct = reenterPct.trim() === "" ? null : Number(reenterPct);
+      if (pct !== null && (!isFinite(pct) || pct <= 0 || pct > 95)) {
+        notify.warn("Enter a % between 0 and 95, or leave blank to turn off."); return;
+      }
+      await api("/api/settings/trader/solo-reenter-pct", { method: "PATCH", body: JSON.stringify({ pct }) });
+      setSavedPct(reenterPct.trim() === "" ? "" : String(pct));
+      notify.success(pct == null ? "Auto re-enter turned off." : `Auto re-enter set to ${pct}%.`);
+    } catch (e) { notify.fromError(e, "Could not save auto re-enter"); }
+    finally { setSavingPct(false); }
+  }
+
   const loadPositions = useCallback(async () => {
     setPosBusy(true);
     try {
@@ -114,9 +141,10 @@ export default function SoloPage() {
   useEffect(() => {
     loadPositions();
     loadSim();
+    loadSettings();
     const t = setInterval(() => { loadSim(); }, 5000);   // live status + "what-if"
     return () => clearInterval(t);
-  }, [loadPositions, loadSim]);
+  }, [loadPositions, loadSim, loadSettings]);
 
   const selectedPositions = useMemo(
     () => (positions ?? []).filter(p => !excluded.has(posKey(p))),
@@ -284,6 +312,36 @@ export default function SoloPage() {
               {exitBusy === m.mode && <Spinner />}
             </button>
           ))}
+        </div>
+      </section>
+
+      {/* Auto re-enter setting */}
+      <section className="p-4 rounded border space-y-2" style={{ borderColor: "var(--border)", background: "var(--panel)" }}>
+        <h2 className="font-medium">Auto re-enter</h2>
+        <p className="text-sm" style={{ color: "var(--muted)" }}>
+          After an Exit All, automatically re-enter each position when its price moves this %
+          favorably from your exit — a long buys back on a dip, a short re-shorts on a rise.
+          Placed as a limit order at the trigger price. Needs live market-data; leave blank to turn off.
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex items-center gap-1">
+            <input
+              type="number" min="0" max="95" step="0.5" inputMode="decimal"
+              value={reenterPct} onChange={e => setReenterPct(e.target.value)}
+              placeholder="off"
+              className="w-24 p-2 rounded bg-transparent border text-sm"
+              style={{ borderColor: "var(--border)", color: "var(--text)" }}
+            />
+            <span className="text-sm" style={{ color: "var(--muted)" }}>%</span>
+          </div>
+          <button onClick={saveReenterPct} disabled={savingPct || reenterPct === savedPct}
+            className="px-3 py-2 rounded text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50"
+            style={{ background: "var(--accent)", color: "#06121f" }}>
+            <span>Save</span>{savingPct && <Spinner />}
+          </button>
+          <span className="text-sm" style={{ color: savedPct ? "var(--good)" : "var(--muted)" }}>
+            {savedPct ? `On — re-enter on a ${savedPct}% move` : "Off"}
+          </span>
         </div>
       </section>
 

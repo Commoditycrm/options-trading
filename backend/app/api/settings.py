@@ -28,6 +28,7 @@ from app.schemas.settings import (
     TraderMirrorOnlyFilledIn,
     TraderSettingsOut,
     TraderToggleIn,
+    TraderSoloReenterPctIn,
 )
 from app.services.pnl import get_account_equity, today_realized_pnl
 from app.services import audit
@@ -433,6 +434,31 @@ def toggle_trading(
         entity_type="trader_settings",
         entity_id=user.id,
         metadata={"trading_enabled": payload.trading_enabled},
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    db.refresh(s)
+    return s
+
+
+@router.patch("/trader/solo-reenter-pct", response_model=TraderSettingsOut)
+def set_solo_reenter_pct(
+    payload: TraderSoloReenterPctIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_trader),
+) -> TraderSettings:
+    """Set/clear the solo auto re-enter threshold. When set, the trader's exited
+    positions are armed so the position_monitor re-enters them once price moves
+    this % favorably from the exit. None clears it (off)."""
+    s = db.get(TraderSettings, user.id)
+    if not s:
+        raise HTTPException(404, "settings_missing")
+    s.solo_reenter_pct = payload.pct
+    audit.record(
+        db, actor_user_id=user.id, action="trader.solo_reenter_pct_set",
+        entity_type="trader_settings", entity_id=user.id,
+        metadata={"solo_reenter_pct": str(payload.pct) if payload.pct is not None else None},
         ip_address=client_ip(request),
     )
     db.commit()

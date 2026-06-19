@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
@@ -60,6 +60,11 @@ class SoloExitItem(Base):
     quantity: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
     entry_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    # Armed for the position_monitor's solo auto re-enter pass (set at Exit All
+    # when the trader has solo_reenter_pct configured + a known exit price).
+    auto_reenter_armed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

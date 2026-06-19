@@ -56,8 +56,15 @@ class TraderSettingsOut(BaseModel):
     mirror_only_filled: bool = False
     default_broker_account_id: uuid.UUID | None = None
     solo_mode: bool = False
+    solo_reenter_pct: Decimal | None = None
 
     model_config = {"from_attributes": True}
+
+
+class TraderSoloReenterPctIn(BaseModel):
+    # Favorable-move % from exit that auto re-enters a solo trader's position.
+    # None clears it (auto re-enter off). Bounded to a sane 0.1–95% range.
+    pct: Decimal | None = Field(default=None, gt=0, le=95)
 
 
 class TraderMirrorOnlyFilledIn(BaseModel):

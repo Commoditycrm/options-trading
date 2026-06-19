@@ -55,6 +55,12 @@ class TraderSettings(Base, TimestampMixin):
     # (not open/pending). Default False = mirror immediately on detection.
     mirror_only_filled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # Solo auto re-enter: when set, a solo trader's exited positions are armed
+    # so the position_monitor re-enters them once price moves this % favorably
+    # from the exit (long → buy back on a dip; short → re-short on a rise).
+    # NULL = off. Only meaningful with solo_mode + market-data entitlement.
+    solo_reenter_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3), nullable=True)
+
     # Req #1 (Option B): trader can connect multiple brokers (Alpaca + Webull).
     # This stores which one to pre-select in the Trade Panel dropdown.
     # NULL means no preference (first connected account is used).

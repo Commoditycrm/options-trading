@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -29,7 +30,8 @@ from app.database import SessionLocal
 from app.models.broker_account import BrokerAccount
 from app.models.order import InstrumentType, Order, OrderSide, OrderStatus, OrderType
 from app.models.position_rule import PositionRule, PositionRuleStatus
-from app.models.settings import SubscriberSettings
+from app.models.settings import SubscriberSettings, TraderSettings
+from app.models.solo import SoloExitItem, SoloExitSnapshot
 from app.services import audit, events, memory_cache
 from app.services.copy_engine import _order_event
 from app.services.crypto import decrypt_json
@@ -385,6 +387,174 @@ def heartbeat_status() -> dict[str, Any]:
     }
 
 
+def _solo_quote_mid(adapter, item: SoloExitItem) -> Decimal | None:
+    """Live mid for a solo exit item's contract, or None if unavailable
+    (degrades silently — no market-data means the watcher just can't fire)."""
+    try:
+        if item.instrument_type == "option" and item.occ_symbol:
+            q = adapter.get_option_quote(item.occ_symbol)
+        else:
+            q = adapter.get_stock_quote(item.symbol)
+    except Exception:  # noqa: BLE001
+        return None
+    m = q.get("mid")
+    return Decimal(str(m)) if (m is not None and m > 0) else None
+
+
+def _place_solo_reentry(
+    db, acct: BrokerAccount, adapter, item: SoloExitItem,
+    side: OrderSide, limit_price: Decimal, pct: Decimal,
+) -> str:
+    """Re-enter one armed solo position as a LIMIT order at the trigger price,
+    record the Order, remove the exit item (closing the snapshot when empty),
+    audit + notify. Returns an outcome tag."""
+    from app.brokers.alpaca import _parse_occ
+
+    is_option = item.instrument_type == "option"
+    expiry = strike = right = None
+    if is_option and item.occ_symbol:
+        parsed = _parse_occ(item.occ_symbol)
+        if parsed:
+            _, expiry, strike, right = parsed
+
+    order = Order(
+        user_id=acct.user_id,
+        broker_account_id=acct.id,
+        instrument_type=InstrumentType(item.instrument_type),
+        symbol=item.symbol,
+        option_expiry=expiry, option_strike=strike, option_right=right,
+        side=side,
+        order_type=OrderType.LIMIT,
+        quantity=item.quantity,
+        limit_price=limit_price,
+        status=OrderStatus.PENDING,
+        is_closing=False,
+    )
+    db.add(order)
+    db.flush()
+
+    request = BrokerOrderRequest(
+        instrument_type=order.instrument_type, symbol=order.symbol, side=order.side,
+        order_type=OrderType.LIMIT, quantity=order.quantity, limit_price=limit_price,
+        stop_price=None, option_expiry=expiry, option_strike=strike, option_right=right,
+        client_order_id=str(order.id),
+    )
+    now = datetime.now(timezone.utc)
+    label = item.occ_symbol or item.symbol
+    try:
+        resp = place_order_with_recovery(adapter, request)
+    except Exception as exc:  # noqa: BLE001
+        order.status = OrderStatus.REJECTED
+        order.reject_reason = str(exc)[:480]
+        order.closed_at = now
+        audit.record(
+            db, actor_user_id=acct.user_id, action="solo.auto_reenter_failed",
+            entity_type="order", entity_id=order.id,
+            metadata={"symbol": label, "error": str(exc)[:300], "limit_price": str(limit_price)},
+        )
+        db.commit()
+        events.publish(acct.user_id, _order_event("order.updated", order))
+        return "failed"
+
+    order.status = resp.status
+    order.broker_order_id = resp.broker_order_id
+    order.submitted_at = resp.submitted_at
+    order.filled_quantity = resp.filled_quantity
+    order.filled_avg_price = resp.filled_avg_price
+    audit.record(
+        db, actor_user_id=acct.user_id, action="solo.auto_reentered",
+        entity_type="order", entity_id=order.id,
+        metadata={"symbol": label, "side": side.value, "qty": str(item.quantity),
+                  "limit_price": str(limit_price), "reenter_pct": str(pct),
+                  "broker_order_id": resp.broker_order_id},
+    )
+    create_notification(
+        db, user_id=acct.user_id, type="solo.auto_reentered",
+        message=f"Auto re-entered {label} — {side.value} {item.quantity} @ limit {limit_price} "
+                f"(price moved {pct}% from your exit).",
+        metadata={"symbol": label, "side": side.value, "qty": str(item.quantity),
+                  "limit_price": str(limit_price), "order_id": str(order.id)},
+    )
+
+    # Remove the item so the simulation stops showing it; close the snapshot
+    # once nothing exited remains (mirrors manual re-enter).
+    sid = item.snapshot_id
+    db.delete(item)
+    db.flush()
+    remaining = db.execute(
+        select(SoloExitItem.id).where(SoloExitItem.snapshot_id == sid)
+    ).first()
+    if remaining is None:
+        snap = db.get(SoloExitSnapshot, sid)
+        if snap is not None and snap.reentered_at is None:
+            snap.reentered_at = now
+    db.commit()
+    events.publish(acct.user_id, _order_event("order.updated", order))
+    return "placed"
+
+
+def _check_solo_reentries() -> int:
+    """Solo auto re-enter pass: for every armed exit item in an open snapshot
+    whose trader set solo_reenter_pct, re-enter once price has moved that %
+    favorably from the exit (long → dip-buy; short → rise-short). LIMIT orders
+    at the trigger price. Needs market-data for a live mid; degrades silently."""
+    placed = 0
+    with SessionLocal() as db:
+        rows = db.execute(
+            select(SoloExitItem, TraderSettings.solo_reenter_pct)
+            .join(SoloExitSnapshot, SoloExitItem.snapshot_id == SoloExitSnapshot.id)
+            .join(TraderSettings, TraderSettings.user_id == SoloExitSnapshot.user_id)
+            .where(
+                SoloExitItem.auto_reenter_armed.is_(True),
+                SoloExitSnapshot.reentered_at.is_(None),
+                TraderSettings.solo_reenter_pct.isnot(None),
+            )
+        ).all()
+        if not rows:
+            return 0
+
+        adapters: dict = {}  # broker_account_id -> (adapter, acct)
+        for item, pct in rows:
+            if item.exit_price is None or pct is None:
+                continue
+            cached = adapters.get(item.broker_account_id)
+            if cached is None:
+                acct = db.get(BrokerAccount, item.broker_account_id)
+                a = None
+                if acct is not None and acct.connection_status == "connected":
+                    try:
+                        a = adapter_for(acct, decrypt_json(acct.encrypted_credentials))
+                    except Exception:  # noqa: BLE001
+                        a = None
+                adapters[item.broker_account_id] = cached = (a, acct)
+            adapter, acct = cached
+            if adapter is None or acct is None:
+                continue
+
+            mid = _solo_quote_mid(adapter, item)
+            if mid is None:
+                continue
+
+            exit_price = item.exit_price
+            if item.original_side == "buy":   # exited a long → buy back on a dip
+                trigger = exit_price * (1 - pct / Decimal(100))
+                fire, side = (mid <= trigger), OrderSide.BUY
+            else:                              # exited a short → re-short on a rise
+                trigger = exit_price * (1 + pct / Decimal(100))
+                fire, side = (mid >= trigger), OrderSide.SELL
+            if not fire:
+                continue
+
+            limit_price = trigger.quantize(Decimal("0.01"))
+            try:
+                if _place_solo_reentry(db, acct, adapter, item, side, limit_price, pct) == "placed":
+                    placed += 1
+            except Exception:  # noqa: BLE001
+                log.exception("position_monitor: solo re-entry failed for item=%s", item.id)
+                db.rollback()
+    return placed
+
+
 def poll_loop(shutdown_check=None) -> None:
     """Long-running loop. Every POLL_INTERVAL_SEC, polls only the broker
     accounts that currently have an ACTIVE position rule."""
@@ -431,6 +601,15 @@ def poll_loop(shutdown_check=None) -> None:
                     _check_account(account_id)
                 except Exception:  # noqa: BLE001
                     log.exception("position_monitor: error on acct=%s", account_id)
+
+            # Solo auto re-enter pass: re-enter armed exited positions on a
+            # favorable move. Self-contained (own session); failures isolated.
+            try:
+                n = _check_solo_reentries()
+                if n:
+                    log.info("position_monitor: auto re-entered %d solo position(s)", n)
+            except Exception:  # noqa: BLE001
+                log.exception("position_monitor: solo auto re-enter pass failed")
         except Exception:  # noqa: BLE001
             log.exception("position_monitor: poll iteration failed")
 
