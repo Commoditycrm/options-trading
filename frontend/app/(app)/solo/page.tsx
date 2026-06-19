@@ -119,8 +119,8 @@ export default function SoloPage() {
     finally { setSavingPct(false); }
   }
 
-  const loadPositions = useCallback(async () => {
-    setPosBusy(true);
+  const loadPositions = useCallback(async (quiet = false) => {
+    if (!quiet) setPosBusy(true);
     try {
       const ps = (await api<Position[]>("/api/positions")).filter(p => Number(p.quantity) !== 0);
       setPositions(ps);
@@ -129,8 +129,8 @@ export default function SoloPage() {
         const valid = new Set(ps.map(posKey));
         return new Set([...prev].filter(k => valid.has(k)));
       });
-    } catch { setPositions([]); }
-    finally { setPosBusy(false); }
+    } catch { /* keep last positions on a transient error */ }
+    finally { if (!quiet) setPosBusy(false); }
   }, []);
 
   const loadSim = useCallback(async () => {
@@ -142,7 +142,11 @@ export default function SoloPage() {
     loadPositions();
     loadSim();
     loadSettings();
-    const t = setInterval(() => { loadSim(); }, 5000);   // live status + "what-if"
+    // Keep BOTH tables live: refresh open positions (quietly) alongside the
+    // simulation so a position drops out of the top table once its closing
+    // order actually fills — otherwise it lingers and looks like it's "in both
+    // tables" after Exit All.
+    const t = setInterval(() => { loadSim(); loadPositions(true); }, 5000);
     return () => clearInterval(t);
   }, [loadPositions, loadSim, loadSettings]);
 
@@ -239,7 +243,7 @@ export default function SoloPage() {
               want to keep. Bid/Ask place limit orders at the live quote (fall back to market).
             </p>
           </div>
-          <button onClick={loadPositions} disabled={posBusy}
+          <button onClick={() => loadPositions()} disabled={posBusy}
             className="text-sm px-2 py-1 rounded border inline-flex items-center gap-2"
             style={{ borderColor: "var(--border)", color: "var(--muted)" }}>
             {posBusy ? <Spinner /> : "↻"} Refresh
