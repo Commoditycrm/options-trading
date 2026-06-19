@@ -104,12 +104,22 @@ function IconStar() {
   );
 }
 
+function IconChart() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M3 3v18h18" />
+      <path d="M7 14l4-4 3 3 5-6" />
+    </svg>
+  );
+}
 const NAV_TRADER = [
   { href: "/trade-panel", label: "Trade Panel", Icon: IconBolt },
   { href: "/watchlist", label: "Watchlist", Icon: IconStar },
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
+  // The trader's own trading performance (realized P&L, win rate, per-symbol).
+  { href: "/my-performance", label: "My Trading", Icon: IconChart },
   { href: "/subscribers", label: "Subscribers", Icon: IconUsers },
   // Per-trade latency breakdown — detection lag, fanout duration, total
   // end-to-end time. The visible proof of "fast and live" for client demos.
@@ -145,6 +155,9 @@ const NAV_SOLO = [
   { href: "/positions", label: "Positions", Icon: IconLayers },
   { href: "/trades", label: "Order History", Icon: IconList },
   { href: "/calendar", label: "P&L", Icon: IconCalendar },
+  // Solo traders have no fan-out Performance page, but still want their own
+  // trading stats — this is their performance view.
+  { href: "/my-performance", label: "My Trading", Icon: IconChart },
   { href: "/brokers", label: "Broker", Icon: IconLink },
   { href: "/settings", label: "Settings", Icon: IconSettings },
 ];

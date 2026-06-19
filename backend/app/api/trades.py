@@ -19,7 +19,7 @@ from app.schemas.order import CloseOrderIn, DailyPnL, OrderOut, PlaceOrderIn
 from app.services import audit, copy_engine, events, fanout_stream, fills_sync
 from app.services.crypto import decrypt_json
 from app.services.order_retry import RecoverableOrderError, place_order_with_recovery
-from app.services.pnl import realized_pnl_by_day
+from app.services.pnl import closed_trades, get_account_equity, realized_pnl_by_day
 
 router = APIRouter(prefix="/api", tags=["trades"])
 
@@ -939,3 +939,98 @@ def fanout_performance(
             "subscribers": subscribers_rows,
         })
     return out
+
+
+@router.get("/trader/performance")
+def trader_self_performance(
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+    range_: str = Query(default="30d", alias="range", pattern="^(7d|30d|90d|all)$"),
+    tz: str | None = Query(default=None),
+) -> dict:
+    """The caller's OWN trading performance (not fan-out): realized P&L,
+    win/loss stats, an equity curve, and a per-symbol breakdown. This is what a
+    solo trader sees in place of the subscriber-centric Fanout Performance page,
+    and what any trader sees on the "My Trading" view.
+
+    Computed on the fly from fills (no new tables). `range` windows the returned
+    series/aggregates; lots before the window are still walked so realized P&L
+    stays correct."""
+    from datetime import timedelta
+
+    # Resolve the window. "all" => no start filter.
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(range_)
+    today = datetime.now(timezone.utc).date()
+    start = (today - timedelta(days=days - 1)) if days else None
+
+    # Refresh fills so freshly-filled orders land on the right day.
+    try:
+        fills_sync.sync_user_fills(db, user.id)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+    trades = closed_trades(db, user.id, start=start, end=today, tz_name=tz)
+
+    # ── Aggregates ────────────────────────────────────────────────────────
+    from decimal import Decimal as _Dec
+    wins = [t for t in trades if t.pnl > 0]
+    losses = [t for t in trades if t.pnl < 0]
+    realized_total = sum((t.pnl for t in trades), _Dec(0))
+    gross_win = sum((t.pnl for t in wins), _Dec(0))
+    gross_loss = sum((t.pnl for t in losses), _Dec(0))  # negative
+    n = len(trades)
+
+    def q2(d: _Dec) -> str:
+        return str(d.quantize(_Dec("0.01")))
+
+    summary = {
+        "realized_total": q2(realized_total),
+        "trade_count": n,
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "win_rate": round(len(wins) / n * 100, 1) if n else 0.0,
+        "avg_win": q2(gross_win / len(wins)) if wins else None,
+        "avg_loss": q2(gross_loss / len(losses)) if losses else None,
+        "largest_win": q2(max((t.pnl for t in wins), default=_Dec(0))) if wins else None,
+        "largest_loss": q2(min((t.pnl for t in losses), default=_Dec(0))) if losses else None,
+        "profit_factor": (round(float(gross_win / -gross_loss), 2) if gross_loss < 0 else None),
+        "equity": q2(get_account_equity(db, user.id) or _Dec(0)),
+    }
+
+    # ── Equity curve: cumulative realized P&L by day ──────────────────────
+    by_day: dict = {}
+    for t in trades:
+        cur_p, cur_n = by_day.get(t.closed_on, (_Dec(0), 0))
+        by_day[t.closed_on] = (cur_p + t.pnl, cur_n + 1)
+    daily = []
+    running = _Dec(0)
+    for d in sorted(by_day):
+        pnl, cnt = by_day[d]
+        running += pnl
+        daily.append({"date": d.isoformat(), "pnl": q2(pnl),
+                      "cumulative": q2(running), "trades": cnt})
+
+    # ── Per-symbol breakdown ──────────────────────────────────────────────
+    by_sym: dict = {}
+    for t in trades:
+        p, w, c = by_sym.get(t.symbol, (_Dec(0), 0, 0))
+        by_sym[t.symbol] = (p + t.pnl, w + (1 if t.pnl > 0 else 0), c + 1)
+    by_symbol = sorted(
+        [{"symbol": s, "pnl": q2(p), "trades": c,
+          "win_rate": round(w / c * 100, 1) if c else 0.0}
+         for s, (p, w, c) in by_sym.items()],
+        key=lambda r: float(r["pnl"]),
+        reverse=True,
+    )
+
+    # ── Recent closed trades (newest first) ───────────────────────────────
+    recent = [
+        {"symbol": t.symbol, "instrument_type": t.instrument_type,
+         "quantity": str(t.quantity), "pnl": q2(t.pnl),
+         "closed_at": t.closed_at.isoformat()}
+        for t in sorted(trades, key=lambda x: x.closed_at, reverse=True)[:25]
+    ]
+
+    return {"range": range_, "summary": summary, "daily": daily,
+            "by_symbol": by_symbol, "recent_trades": recent}

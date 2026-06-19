@@ -181,6 +181,103 @@ def realized_pnl_by_day(
     return dict(daily)
 
 
+@dataclass
+class ClosedTrade:
+    """One realized (closing) round-trip event for self-performance stats."""
+    symbol: str
+    instrument_type: str  # "stock" | "option"
+    quantity: Decimal     # quantity closed in this event
+    pnl: Decimal
+    closed_on: date       # bucketed in the chosen timezone
+    closed_at: datetime
+
+
+def closed_trades(
+    db: Session,
+    user_id: uuid.UUID,
+    start: date | None = None,
+    end: date | None = None,
+    tz_name: str | None = None,
+) -> list[ClosedTrade]:
+    """Per-round-trip realized P&L events (same FIFO lot-matching as
+    realized_pnl_by_day, but emits each closing event instead of day totals).
+    Powers win-rate / avg-win / per-symbol / equity-curve on the self-performance
+    page. Events with closed_on < start are still walked (to keep lots correct)
+    but excluded from the returned list."""
+    orders: list[Order] = list(db.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.filled_quantity > 0,
+            Order.filled_avg_price.isnot(None),
+        )
+    ).scalars())
+    if not orders:
+        return []
+
+    order_ids = [o.id for o in orders]
+    fills_by_order: dict[uuid.UUID, list[Fill]] = defaultdict(list)
+    for f in db.execute(select(Fill).where(Fill.order_id.in_(order_ids))).scalars():
+        fills_by_order[f.order_id].append(f)
+
+    timeline: list[tuple[datetime, Decimal, Decimal, Order]] = []
+    for o in orders:
+        fs = fills_by_order.get(o.id)
+        if fs:
+            for f in fs:
+                timeline.append((f.filled_at, f.quantity, f.price, o))
+        else:
+            when = o.closed_at or o.submitted_at or o.created_at
+            timeline.append((when, o.filled_quantity, o.filled_avg_price, o))
+    timeline.sort(key=lambda e: e[0])
+
+    bucket_tz = _tz_or_market(tz_name)
+    open_lots: dict[tuple, deque[_Lot]] = defaultdict(deque)
+    out: list[ClosedTrade] = []
+
+    for filled_at, fill_qty, fill_price, order in timeline:
+        key = _instrument_key(order)
+        unit = Decimal(100) if order.instrument_type == InstrumentType.OPTION else Decimal(1)
+        qty = fill_qty
+        price = fill_price
+        day = filled_at.astimezone(bucket_tz).date()
+        if end and day > end:
+            break
+
+        is_buy = order.side == OrderSide.BUY
+        opposite_open = open_lots[key] and (
+            (is_buy and open_lots[key][0].qty < 0) or (not is_buy and open_lots[key][0].qty > 0)
+        )
+        if opposite_open:
+            pnl = Decimal(0)
+            closed_qty = Decimal(0)
+            while qty > 0 and open_lots[key] and (
+                (is_buy and open_lots[key][0].qty < 0) or (not is_buy and open_lots[key][0].qty > 0)
+            ):
+                lot = open_lots[key][0]
+                take = min(qty, abs(lot.qty))
+                pnl += (lot.price - price) * take * unit if is_buy else (price - lot.price) * take * unit
+                lot.qty += take if is_buy else -take
+                qty -= take
+                closed_qty += take
+                if lot.qty == 0:
+                    open_lots[key].popleft()
+            if start is None or day >= start:
+                out.append(ClosedTrade(
+                    symbol=order.symbol,
+                    instrument_type=order.instrument_type.value,
+                    quantity=closed_qty,
+                    pnl=pnl,
+                    closed_on=day,
+                    closed_at=filled_at,
+                ))
+            if qty > 0:
+                open_lots[key].append(_Lot(qty=qty if is_buy else -qty, price=price))
+        else:
+            open_lots[key].append(_Lot(qty=qty if is_buy else -qty, price=price))
+
+    return out
+
+
 def get_account_equity(db: Session, user_id: uuid.UUID) -> Decimal | None:
     """Sum of total_equity across the user's connected broker accounts, from
     the cached balance snapshot in broker_accounts (no live broker call).

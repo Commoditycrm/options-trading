@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
 import { notify } from "@/lib/toast";
 import { Spinner } from "@/components/Spinner";
@@ -8,7 +8,23 @@ import { ConfirmModal } from "@/components/ConfirmModal";
 
 type Mode = "market" | "bid" | "ask";
 
+interface Position {
+  broker_account_id: string;
+  broker_symbol: string;
+  symbol: string;
+  instrument_type: string;
+  quantity: string;          // signed
+  avg_entry_price: string | null;
+  current_price: string | null;
+  unrealized_pnl: string | null;
+}
+
 interface SimItem {
+  item_id: string;
+  order_id: string | null;
+  order_status: string | null;
+  filled_avg_price: string | null;
+  reject_reason: string | null;
   symbol: string;
   occ_symbol: string | null;
   instrument_type: string;
@@ -24,6 +40,7 @@ interface Simulation {
   exit_mode?: string;
   reentered_at?: string | null;
   items: SimItem[];
+  any_rejected?: boolean;
   quotes_available?: boolean;
 }
 
@@ -36,11 +53,58 @@ const MODES: { mode: Mode; label: string }[] = [
   { mode: "ask", label: "Ask" },
 ];
 
+const posKey = (p: { broker_account_id: string; broker_symbol: string }) =>
+  `${p.broker_account_id}:${p.broker_symbol}`;
+
+function statusBadge(status: string | null) {
+  if (!status) return <span style={{ color: "var(--muted)" }}>—</span>;
+  const map: Record<string, { bg: string; color: string }> = {
+    filled: { bg: "var(--good-soft)", color: "var(--good)" },
+    submitted: { bg: "rgba(10,115,168,0.10)", color: "var(--accent)" },
+    accepted: { bg: "rgba(10,115,168,0.10)", color: "var(--accent)" },
+    partially_filled: { bg: "rgba(10,115,168,0.10)", color: "var(--accent)" },
+    pending: { bg: "rgba(255,255,255,0.04)", color: "var(--muted)" },
+    rejected: { bg: "var(--bad-soft)", color: "var(--bad)" },
+    canceled: { bg: "rgba(255,255,255,0.04)", color: "var(--muted)" },
+    expired: { bg: "rgba(255,255,255,0.04)", color: "var(--muted)" },
+  };
+  const s = map[status] || { bg: "rgba(255,255,255,0.04)", color: "var(--muted)" };
+  return (
+    <span className="text-[11px] uppercase tracking-wider px-2 py-[3px] rounded whitespace-nowrap font-medium"
+      style={{ background: s.bg, color: s.color }}>
+      {status.replace("_", " ")}
+    </span>
+  );
+}
+
 export default function SoloPage() {
+  const [positions, setPositions] = useState<Position[] | null>(null);
+  const [posBusy, setPosBusy] = useState(false);
+  // Position keys the trader has UNCHECKED (excluded from Exit All). Default =
+  // everything checked, so the common one-click flow stays unchanged.
+  const [excluded, setExcluded] = useState<Set<string>>(new Set());
+
   const [sim, setSim] = useState<Simulation | null>(null);
+  // Re-enter selection: snapshot item_ids the trader has UNCHECKED.
+  const [reExcluded, setReExcluded] = useState<Set<string>>(new Set());
+
   const [exitBusy, setExitBusy] = useState<Mode | null>(null);
   const [reenterBusy, setReenterBusy] = useState<Mode | null>(null);
   const [confirm, setConfirm] = useState<{ action: "exit" | "reenter"; mode: Mode } | null>(null);
+
+  const loadPositions = useCallback(async () => {
+    setPosBusy(true);
+    try {
+      const ps = (await api<Position[]>("/api/positions")).filter(p => Number(p.quantity) !== 0);
+      setPositions(ps);
+      // Drop excludes that no longer correspond to a held position.
+      setExcluded(prev => {
+        const valid = new Set(ps.map(posKey));
+        return new Set([...prev].filter(k => valid.has(k)));
+      });
+    } catch { setPositions([]); }
+    finally { setPosBusy(false); }
+  }, []);
 
   const loadSim = useCallback(async () => {
     try { setSim(await api<Simulation>("/api/solo/simulation")); }
@@ -48,21 +112,39 @@ export default function SoloPage() {
   }, []);
 
   useEffect(() => {
+    loadPositions();
     loadSim();
-    const t = setInterval(loadSim, 5000);   // live "what-if" refresh
+    const t = setInterval(() => { loadSim(); }, 5000);   // live status + "what-if"
     return () => clearInterval(t);
-  }, [loadSim]);
+  }, [loadPositions, loadSim]);
+
+  const selectedPositions = useMemo(
+    () => (positions ?? []).filter(p => !excluded.has(posKey(p))),
+    [positions, excluded],
+  );
+  const allChecked = positions != null && excluded.size === 0;
 
   async function exitAll(mode: Mode) {
     setExitBusy(mode);
     try {
+      // If everything is checked, send no selection → backend exits ALL and
+      // cancels open orders first (identical to the original one-click). If a
+      // subset is checked, send exactly those (and leave the rest untouched).
+      const body = allChecked
+        ? undefined
+        : JSON.stringify({
+            selections: selectedPositions.map(p => ({
+              broker_account_id: p.broker_account_id, broker_symbol: p.broker_symbol,
+            })),
+          });
       const res = await api<{ closed_count: number; failed_count: number }>(
-        `/api/solo/exit-all?mode=${mode}`, { method: "POST" });
+        `/api/solo/exit-all?mode=${mode}`, { method: "POST", body });
       notify[res.closed_count > 0 ? "success" : "info"](
         res.closed_count > 0
           ? `Exited ${res.closed_count} position(s) @ ${mode}${res.failed_count ? ` — ${res.failed_count} failed` : ""}`
-          : "No open positions to exit.");
+          : "No positions exited.");
       setConfirm(null);
+      loadPositions();
       loadSim();
     } catch (e) { notify.fromError(e, "Exit all failed"); }
     finally { setExitBusy(null); }
@@ -71,48 +153,139 @@ export default function SoloPage() {
   async function reenterAll(mode: Mode) {
     setReenterBusy(mode);
     try {
+      const wanted = (sim?.items ?? []).filter(it => !reExcluded.has(it.item_id));
+      const allItems = (sim?.items.length ?? 0) === wanted.length;
+      const body = allItems ? undefined : JSON.stringify({ item_ids: wanted.map(it => it.item_id) });
       const res = await api<{ placed_count: number; failed_count: number }>(
-        `/api/solo/reenter-all?mode=${mode}`, { method: "POST" });
+        `/api/solo/reenter-all?mode=${mode}`, { method: "POST", body });
       notify[res.placed_count > 0 ? "success" : "info"](
         `Re-entered ${res.placed_count} position(s) @ ${mode}${res.failed_count ? ` — ${res.failed_count} failed` : ""}`);
       setConfirm(null);
+      setReExcluded(new Set());
+      loadPositions();
       loadSim();
     } catch (e) { notify.fromError(e, "Re-enter failed"); }
     finally { setReenterBusy(null); }
   }
 
-  const hasSnapshot = !!sim?.snapshot_id && !sim?.reentered_at;
+  const hasSnapshot = !!sim?.snapshot_id && !sim?.reentered_at && (sim?.items.length ?? 0) > 0;
   const busy = exitBusy !== null || reenterBusy !== null;
+  const exitCount = selectedPositions.length;
+
+  function toggle(key: string) {
+    setExcluded(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+  function toggleAll() {
+    setExcluded(prev => (prev.size === 0 ? new Set((positions ?? []).map(posKey)) : new Set()));
+  }
+  function toggleRe(id: string) {
+    setReExcluded(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
 
   return (
     <div className="space-y-5 max-w-5xl">
       <h1 className="text-2xl font-semibold">Solo trader</h1>
 
-      {/* Exit controls */}
+      {/* Exit controls + per-position checkboxes */}
       <section className="p-4 rounded border space-y-3" style={{ borderColor: "var(--border)", background: "var(--panel)" }}>
-        <h2 className="font-medium">Exit all positions</h2>
-        <p className="text-sm" style={{ color: "var(--muted)" }}>
-          Close every open position at once. Bid/Ask place limit orders at the live quote
-          (and fall back to market if no quote is available).
-        </p>
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div>
+            <h2 className="font-medium">Exit positions</h2>
+            <p className="text-sm" style={{ color: "var(--muted)" }}>
+              Every position is checked by default — one click exits them all. Uncheck any you
+              want to keep. Bid/Ask place limit orders at the live quote (fall back to market).
+            </p>
+          </div>
+          <button onClick={loadPositions} disabled={posBusy}
+            className="text-sm px-2 py-1 rounded border inline-flex items-center gap-2"
+            style={{ borderColor: "var(--border)", color: "var(--muted)" }}>
+            {posBusy ? <Spinner /> : "↻"} Refresh
+          </button>
+        </div>
+
+        {positions == null ? (
+          <p style={{ color: "var(--muted)" }}><span className="inline-flex items-center gap-2"><Spinner /> Loading positions…</span></p>
+        ) : positions.length === 0 ? (
+          <p style={{ color: "var(--muted)" }}>No open positions.</p>
+        ) : (
+          <div className="overflow-x-auto rounded border" style={{ borderColor: "var(--border)" }}>
+            <table className="w-full text-sm">
+              <thead style={{ background: "var(--panel)" }}>
+                <tr>
+                  <th className="px-3 py-2 w-8">
+                    <input type="checkbox" checked={allChecked} onChange={toggleAll} aria-label="Select all" />
+                  </th>
+                  {["Contract", "Side", "Qty", "Avg entry", "Mark", "Unrealized"].map(h => (
+                    <th key={h} className="text-left px-3 py-2 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {positions.map(p => {
+                  const k = posKey(p);
+                  const qty = Number(p.quantity);
+                  const isLong = qty > 0;
+                  const upnl = p.unrealized_pnl == null ? null : Number(p.unrealized_pnl);
+                  return (
+                    <tr key={k} className="border-t" style={{ borderColor: "var(--border)" }}>
+                      <td className="px-3 py-2">
+                        <input type="checkbox" checked={!excluded.has(k)} onChange={() => toggle(k)} aria-label={`Exit ${p.broker_symbol}`} />
+                      </td>
+                      <td className="px-3 py-2 num">{p.broker_symbol}</td>
+                      <td className="px-3 py-2" style={{ color: isLong ? "var(--good)" : "var(--bad)" }}>{isLong ? "LONG" : "SHORT"}</td>
+                      <td className="px-3 py-2 num">{Math.abs(qty)}</td>
+                      <td className="px-3 py-2 num">{fmt(p.avg_entry_price)}</td>
+                      <td className="px-3 py-2 num">{fmt(p.current_price)}</td>
+                      <td className="px-3 py-2 num" style={{ color: upnl == null ? "var(--muted)" : upnl >= 0 ? "var(--good)" : "var(--bad)" }}>
+                        {upnl == null ? "—" : fmt(p.unrealized_pnl)}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center gap-2">
           {MODES.map(m => (
-            <button key={m.mode} onClick={() => setConfirm({ action: "exit", mode: m.mode })} disabled={busy}
-              className="btn-danger-soft px-3 py-2 text-sm font-medium inline-flex items-center gap-2">
+            <button key={m.mode} onClick={() => setConfirm({ action: "exit", mode: m.mode })}
+              disabled={busy || exitCount === 0}
+              className="btn-danger-soft px-3 py-2 text-sm font-medium inline-flex items-center gap-2 disabled:opacity-50">
               <span>Exit All @ {m.label}</span>
               {exitBusy === m.mode && <Spinner />}
             </button>
           ))}
+          {positions != null && positions.length > 0 && (
+            <span className="text-sm" style={{ color: "var(--muted)" }}>
+              {exitCount} of {positions.length} selected
+            </span>
+          )}
         </div>
       </section>
 
-      {/* Simulation + re-enter */}
+      {/* Reject banner */}
+      {hasSnapshot && sim?.any_rejected && (
+        <div className="p-3 rounded border text-sm" style={{ borderColor: "var(--bad)", background: "var(--bad-soft)", color: "var(--bad)" }}>
+          ⚠ One or more exit orders did not go through (rejected / canceled). Check the status column below and re-exit those positions.
+        </div>
+      )}
+
+      {/* Simulation + status + re-enter */}
       <section className="p-4 rounded border space-y-3" style={{ borderColor: "var(--border)", background: "var(--panel)" }}>
         <div className="flex items-center justify-between gap-3 flex-wrap">
           <div>
-            <h2 className="font-medium">Simulation — what if you had held</h2>
+            <h2 className="font-medium">Last exit — status &amp; what-if</h2>
             <p className="text-sm" style={{ color: "var(--muted)" }}>
-              Live mark of the positions you last exited. Refreshes every 5s.
+              Live order status of your last exit plus the &quot;P&amp;L if you had held&quot;. Refreshes every 5s.
               {sim && sim.quotes_available === false && " (Live quotes unavailable — market-data not enabled.)"}
             </p>
           </div>
@@ -131,26 +304,34 @@ export default function SoloPage() {
         </div>
 
         {!hasSnapshot ? (
-          <p style={{ color: "var(--muted)" }}>No exited positions to simulate yet — use Exit All above.</p>
+          <p style={{ color: "var(--muted)" }}>No exited positions yet — use Exit All above.</p>
         ) : (
           <div className="overflow-x-auto rounded border" style={{ borderColor: "var(--border)" }}>
             <table className="w-full text-sm">
               <thead style={{ background: "var(--panel)" }}>
                 <tr>
-                  {["Contract", "Side", "Qty", "Entry", "Exit", "Now (mid)", "P&L if held"].map(h => (
+                  <th className="px-3 py-2 w-8" title="Include in Re-Enter">✓</th>
+                  {["Contract", "Side", "Qty", "Status", "Fill", "Exit", "Now (mid)", "P&L if held"].map(h => (
                     <th key={h} className="text-left px-3 py-2 font-medium" style={{ color: "var(--muted)" }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {sim!.items.map((it, i) => {
+                {sim!.items.map(it => {
                   const pnl = it.pnl_if_held == null ? null : Number(it.pnl_if_held);
                   return (
-                    <tr key={i} className="border-t" style={{ borderColor: "var(--border)" }}>
+                    <tr key={it.item_id} className="border-t" style={{ borderColor: "var(--border)" }}>
+                      <td className="px-3 py-2">
+                        <input type="checkbox" checked={!reExcluded.has(it.item_id)} onChange={() => toggleRe(it.item_id)} aria-label={`Re-enter ${it.symbol}`} />
+                      </td>
                       <td className="px-3 py-2 num">{it.occ_symbol ?? it.symbol}</td>
                       <td className="px-3 py-2" style={{ color: it.side === "buy" ? "var(--good)" : "var(--bad)" }}>{it.side.toUpperCase()}</td>
                       <td className="px-3 py-2 num">{Number(it.quantity)}</td>
-                      <td className="px-3 py-2 num">{fmt(it.entry_price)}</td>
+                      <td className="px-3 py-2">
+                        {statusBadge(it.order_status)}
+                        {it.reject_reason && <div className="text-[11px] mt-1" style={{ color: "var(--bad)" }}>{it.reject_reason}</div>}
+                      </td>
+                      <td className="px-3 py-2 num">{fmt(it.filled_avg_price)}</td>
                       <td className="px-3 py-2 num">{fmt(it.exit_price)}</td>
                       <td className="px-3 py-2 num">{fmt(it.current_mid)}</td>
                       <td className="px-3 py-2 num" style={{ color: pnl == null ? "var(--muted)" : pnl >= 0 ? "var(--good)" : "var(--bad)" }}>
@@ -167,11 +348,11 @@ export default function SoloPage() {
 
       <ConfirmModal
         open={confirm !== null}
-        title={confirm?.action === "reenter" ? `Re-enter all @ ${confirm.mode}?` : `Exit all @ ${confirm?.mode}?`}
+        title={confirm?.action === "reenter" ? `Re-enter @ ${confirm.mode}?` : `Exit @ ${confirm?.mode}?`}
         message={confirm?.action === "reenter"
-          ? `This rebuilds every position from your last exit at ${confirm.mode === "market" ? "market" : `the ${confirm.mode}`} (original side + qty).`
-          : `This closes every open position at ${confirm?.mode === "market" ? "market" : `the ${confirm?.mode}`}.`}
-        confirmLabel={confirm?.action === "reenter" ? "Re-enter all" : "Exit all"}
+          ? `This rebuilds the selected position(s) from your last exit at ${confirm.mode === "market" ? "market" : `the ${confirm.mode}`} (original side + qty).`
+          : `This closes ${exitCount} selected position(s) at ${confirm?.mode === "market" ? "market" : `the ${confirm?.mode}`}.`}
+        confirmLabel={confirm?.action === "reenter" ? "Re-enter" : "Exit"}
         variant={confirm?.action === "reenter" ? "primary" : "danger"}
         busy={busy}
         onConfirm={() => { if (confirm?.action === "reenter") reenterAll(confirm.mode); else if (confirm) exitAll(confirm.mode); }}

@@ -48,6 +48,11 @@ class SoloExitItem(Base):
     broker_account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("broker_accounts.id", ondelete="CASCADE"), nullable=False
     )
+    # The closing Order placed for this position (for live status on /solo).
+    # Nullable + SET NULL: an order delete never removes the snapshot row.
+    order_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
     instrument_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "stock" | "option"
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)           # underlying root
     occ_symbol: Mapped[str | None] = mapped_column(String(32), nullable=True) # full OCC for options

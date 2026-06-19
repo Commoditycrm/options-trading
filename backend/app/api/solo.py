@@ -11,10 +11,12 @@ simulation shows null marks).
 from __future__ import annotations
 
 import time
+import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload
 
@@ -24,13 +26,33 @@ from app.brokers import adapter_for
 from app.brokers.alpaca import build_occ_symbol
 from app.database import get_db
 from app.models.broker_account import BrokerAccount, BrokerName
-from app.models.order import InstrumentType, OptionRight, OrderSide, OrderType
+from app.models.order import InstrumentType, OptionRight, Order, OrderSide, OrderType
 from app.models.solo import SoloExitItem, SoloExitSnapshot
 from app.models.user import User
 from app.schemas.order import PlaceOrderIn
 from app.services.crypto import decrypt_json
 
 router = APIRouter(prefix="/api/solo", tags=["solo"])
+
+
+class PositionRef(BaseModel):
+    """Stable identifier for one open position to act on."""
+    broker_account_id: uuid.UUID
+    broker_symbol: str  # broker's canonical id (OCC for options, ticker for stocks)
+
+
+class ExitAllIn(BaseModel):
+    """Optional body for exit-all. When ``selections`` is omitted/null we exit
+    EVERY open position (identical to the original one-click behavior, incl. the
+    account-wide open-order cancel). When a list is supplied we close ONLY those
+    positions and leave everything else — and its working orders — untouched."""
+    selections: list[PositionRef] | None = None
+
+
+class ReenterIn(BaseModel):
+    """Optional body for reenter-all. When ``item_ids`` is omitted/null we
+    re-enter every item in the latest snapshot; otherwise only the listed ones."""
+    item_ids: list[uuid.UUID] | None = None
 
 
 def _quote(adapter, instrument: str, symbol: str, occ: str | None) -> dict:
@@ -65,12 +87,23 @@ def exit_all(
     request: Request,
     background: BackgroundTasks,
     mode: str = Query("market", pattern="^(market|bid|ask)$"),
+    payload: ExitAllIn | None = None,
     db: Session = Depends(get_db),
     trader: User = Depends(require_trader),
 ) -> dict:
-    """Flatten every open position across the trader's connected brokers at the
-    chosen price (market / bid / ask) and record a snapshot for the simulation +
-    re-enter. Bid/ask fall back to market when no quote is available."""
+    """Flatten open positions across the trader's connected brokers at the chosen
+    price (market / bid / ask) and record a snapshot for the simulation +
+    re-enter. Bid/ask fall back to market when no quote is available.
+
+    With no body (or selections=null) this exits EVERY position and cancels each
+    account's open orders first (held quantity otherwise blocks the close) —
+    identical to the original one-click Exit All. With a selections list it
+    closes ONLY those positions and does NOT touch other positions or their
+    working orders (a partial exit is a surgical action)."""
+    selected: set[tuple[uuid.UUID, str]] | None = None
+    if payload is not None and payload.selections is not None:
+        selected = {(s.broker_account_id, s.broker_symbol.upper()) for s in payload.selections}
+
     accts = db.execute(
         select(BrokerAccount).where(
             BrokerAccount.user_id == trader.id,
@@ -91,10 +124,11 @@ def exit_all(
     db.add(snapshot)
     db.flush()
 
-    # Build adapters once and cancel each account's open orders FIRST — a
-    # pending order holds quantity ("held_for_orders"), which otherwise makes
-    # the close fail with "insufficient qty available". Then give the broker a
-    # moment to release that quantity before we read positions and close.
+    # Build adapters once. On a FULL exit (no selection) cancel each account's
+    # open orders first — a pending order holds quantity ("held_for_orders"),
+    # which otherwise makes the close fail with "insufficient qty available".
+    # On a PARTIAL exit we skip the account-wide cancel so excluded positions'
+    # working orders stay untouched (the adapter has no per-symbol cancel).
     adapters: dict = {}
     for acct in accts:
         try:
@@ -102,11 +136,12 @@ def exit_all(
         except Exception:  # noqa: BLE001
             adapters[acct.id] = None
             continue
-        try:
-            adapters[acct.id].cancel_all_orders()
-        except Exception:  # noqa: BLE001
-            pass  # best-effort
-    if any(a is not None for a in adapters.values()):
+        if selected is None:
+            try:
+                adapters[acct.id].cancel_all_orders()
+            except Exception:  # noqa: BLE001
+                pass  # best-effort
+    if selected is None and any(a is not None for a in adapters.values()):
         time.sleep(0.6)
 
     closed: list[dict] = []
@@ -121,6 +156,10 @@ def exit_all(
         except Exception as exc:  # noqa: BLE001
             failed.append({"broker_account_id": str(acct.id), "error": str(exc)[:200]})
             continue
+
+        # Honour a partial selection: only close the chosen positions.
+        if selected is not None:
+            positions = [p for p in positions if (acct.id, p.broker_symbol.upper()) in selected]
 
         for pos in positions:
             is_long = pos.quantity > 0
@@ -169,6 +208,7 @@ def exit_all(
                 db.add(SoloExitItem(
                     snapshot_id=snapshot.id,
                     broker_account_id=acct.id,
+                    order_id=order.id,
                     instrument_type=pos.instrument_type.value,
                     symbol=pos.symbol,
                     occ_symbol=occ,
@@ -207,7 +247,17 @@ def simulation(db: Session = Depends(get_db), trader: User = Depends(require_tra
         return {"snapshot_id": None, "items": []}
 
     adapter = _alpaca_adapter_for(db, trader.id)
+
+    # Live status of each exit order, so the /solo page can show submitted /
+    # filled / rejected inline instead of forcing a trip to Order History.
+    order_ids = [it.order_id for it in snap.items if it.order_id is not None]
+    orders_by_id: dict = {}
+    if order_ids:
+        for o in db.execute(select(Order).where(Order.id.in_(order_ids))).scalars():
+            orders_by_id[o.id] = o
+
     items_out: list[dict] = []
+    any_rejected = False
     for it in snap.items:
         mid = None
         if adapter is not None:
@@ -217,7 +267,17 @@ def simulation(db: Session = Depends(get_db), trader: User = Depends(require_tra
         pnl_if_held = None
         if mid is not None and it.exit_price is not None:
             pnl_if_held = (Decimal(str(mid)) - it.exit_price) * it.quantity * unit * sign
+
+        o = orders_by_id.get(it.order_id) if it.order_id else None
+        order_status = o.status.value if o is not None else None
+        if order_status in ("rejected", "canceled", "expired"):
+            any_rejected = True
         items_out.append({
+            "item_id": str(it.id),
+            "order_id": str(it.order_id) if it.order_id else None,
+            "order_status": order_status,
+            "filled_avg_price": str(o.filled_avg_price) if (o and o.filled_avg_price is not None) else None,
+            "reject_reason": o.reject_reason if (o and o.reject_reason) else None,
             "symbol": it.symbol,
             "occ_symbol": it.occ_symbol,
             "instrument_type": it.instrument_type,
@@ -234,6 +294,7 @@ def simulation(db: Session = Depends(get_db), trader: User = Depends(require_tra
         "created_at": snap.created_at.isoformat(),
         "reentered_at": snap.reentered_at.isoformat() if snap.reentered_at else None,
         "items": items_out,
+        "any_rejected": any_rejected,
         "quotes_available": adapter is not None,
     }
 
@@ -243,17 +304,24 @@ def reenter_all(
     request: Request,
     background: BackgroundTasks,
     mode: str = Query("market", pattern="^(market|bid|ask)$"),
+    payload: ReenterIn | None = None,
     db: Session = Depends(get_db),
     trader: User = Depends(require_trader),
 ) -> dict:
-    """Re-open every position from the latest exit snapshot (original side + qty)
-    at the chosen price (market / bid / ask), then mark the snapshot re-entered.
+    """Re-open positions from the latest exit snapshot (original side + qty) at
+    the chosen price (market / bid / ask), then mark the snapshot re-entered.
+    With no body it re-enters every item; with item_ids it re-enters only those.
     Bid/ask place limit orders at the live quote; fall back to market with none."""
     from app.brokers.alpaca import _parse_occ
 
     snap = _latest_open_snapshot(db, trader.id)
     if snap is None:
         raise HTTPException(404, "no_open_snapshot")
+
+    wanted: set[uuid.UUID] | None = None
+    if payload is not None and payload.item_ids is not None:
+        wanted = set(payload.item_ids)
+    items = [it for it in snap.items if wanted is None or it.id in wanted]
 
     # Cache one adapter per broker account (for quotes), built lazily.
     adapters: dict = {}
@@ -271,7 +339,7 @@ def reenter_all(
 
     placed: list[dict] = []
     failed: list[dict] = []
-    for it in snap.items:
+    for it in items:
         is_option = it.instrument_type == "option"
         expiry = strike = right = None
         if is_option and it.occ_symbol:
@@ -290,7 +358,7 @@ def reenter_all(
                     limit_price = px
 
         try:
-            payload = PlaceOrderIn(
+            order_payload = PlaceOrderIn(
                 instrument_type=InstrumentType(it.instrument_type),
                 symbol=it.symbol,
                 side=OrderSide(it.original_side),
@@ -303,15 +371,23 @@ def reenter_all(
                 option_right=right,
             )
             order = _place_trader_order(
-                db, trader, payload, it.broker_account_id, background, request,
+                db, trader, order_payload, it.broker_account_id, background, request,
                 skip_fanout=True, is_closing=False,
             )
             placed.append({"symbol": it.symbol, "qty": str(it.quantity), "order_id": str(order.id),
                            "order_type": order_type.value})
+            # Drop a re-entered item so the simulation stops showing it (and it
+            # can't be re-entered twice). A partial re-enter keeps the rest live.
+            db.delete(it)
         except Exception as exc:  # noqa: BLE001
             failed.append({"symbol": it.symbol, "error": str(exc)[:200]})
 
-    snap.reentered_at = datetime.now(timezone.utc)
+    # Close the snapshot only when nothing exited remains (all items re-entered).
+    remaining = db.execute(
+        select(SoloExitItem).where(SoloExitItem.snapshot_id == snap.id)
+    ).scalars().all()
+    if not remaining:
+        snap.reentered_at = datetime.now(timezone.utc)
     db.commit()
     return {"snapshot_id": str(snap.id), "mode": mode, "placed_count": len(placed),
             "failed_count": len(failed), "placed": placed, "failed": failed}
