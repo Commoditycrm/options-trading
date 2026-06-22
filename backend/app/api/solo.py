@@ -117,17 +117,25 @@ def exit_all(
         )
     ).scalars().all()
 
-    # Only ONE exit snapshot is the active simulation at a time. Close any prior
-    # open snapshot so a fresh Exit All supersedes it (and Re-Enter All then
-    # cleanly clears the table). reentered_at doubles as the "closed" marker.
-    db.execute(
-        update(SoloExitSnapshot)
-        .where(SoloExitSnapshot.user_id == trader.id, SoloExitSnapshot.reentered_at.is_(None))
-        .values(reentered_at=datetime.now(timezone.utc))
-    )
+    # A FULL exit (no selection) supersedes everything: close any prior open
+    # snapshot so a fresh one-click Exit All starts clean (Re-Enter All then
+    # clears the table). A PARTIAL/selective exit instead ACCUMULATES into the
+    # existing open snapshot, so exiting positions one at a time keeps every
+    # exited contract visible in the same "what-if" table instead of the latest
+    # one replacing the previous. reentered_at doubles as the "closed" marker.
+    snapshot = None
+    if selected is None:
+        db.execute(
+            update(SoloExitSnapshot)
+            .where(SoloExitSnapshot.user_id == trader.id, SoloExitSnapshot.reentered_at.is_(None))
+            .values(reentered_at=datetime.now(timezone.utc))
+        )
+    else:
+        snapshot = _latest_open_snapshot(db, trader.id)
 
-    snapshot = SoloExitSnapshot(user_id=trader.id, exit_mode=mode)
-    db.add(snapshot)
+    if snapshot is None:
+        snapshot = SoloExitSnapshot(user_id=trader.id, exit_mode=mode)
+        db.add(snapshot)
     db.flush()
 
     # Build adapters once. On a FULL exit (no selection) cancel each account's
