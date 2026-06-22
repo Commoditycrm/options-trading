@@ -150,11 +150,45 @@ export default function SoloPage() {
     return () => clearInterval(t);
   }, [loadPositions, loadSim, loadSettings]);
 
-  const selectedPositions = useMemo(
-    () => (positions ?? []).filter(p => !excluded.has(posKey(p))),
-    [positions, excluded],
+  // Contracts with a close order still in flight (snapshot not yet re-entered).
+  // Used to grey-out / lock those rows so the trader can't re-fire an exit on a
+  // position that's already mid-close — removes the "shows in both tables" /
+  // "can be selected again" confusion without touching the backend behavior.
+  const pendingClose = useMemo(() => {
+    const s = new Set<string>();
+    if (sim && !sim.reentered_at) {
+      for (const it of sim.items) {
+        const st = it.order_status;
+        const inFlight =
+          st === "submitted" || st === "accepted" ||
+          st === "partially_filled" || st === "pending" ||
+          (!!it.order_id && st == null);
+        if (inFlight) {
+          const key = it.occ_symbol ?? it.symbol;
+          if (key) s.add(key);
+        }
+      }
+    }
+    return s;
+  }, [sim]);
+  const isClosing = useCallback(
+    (p: Position) => pendingClose.has(p.broker_symbol) || pendingClose.has(p.symbol),
+    [pendingClose],
   );
-  const allChecked = positions != null && excluded.size === 0;
+
+  const selectedPositions = useMemo(
+    () => (positions ?? []).filter(p => !excluded.has(posKey(p)) && !isClosing(p)),
+    [positions, excluded, isClosing],
+  );
+  // "Select all" reflects the *selectable* rows only — closing rows are locked
+  // out, so ignore them when deciding whether everything is checked.
+  const selectable = useMemo(
+    () => (positions ?? []).filter(p => !isClosing(p)),
+    [positions, isClosing],
+  );
+  const allChecked =
+    positions != null && selectable.length > 0 &&
+    selectable.every(p => !excluded.has(posKey(p)));
 
   // Total unrealized P&L — all positions vs the checked subset — so the trader
   // can see what exiting will realize before clicking.
@@ -219,7 +253,8 @@ export default function SoloPage() {
     });
   }
   function toggleAll() {
-    setExcluded(prev => (prev.size === 0 ? new Set((positions ?? []).map(posKey)) : new Set()));
+    // Only flip the selectable (non-closing) rows; closing rows stay locked out.
+    setExcluded(prev => (allChecked ? new Set(selectable.map(posKey)) : new Set()));
   }
   function toggleRe(id: string) {
     setReExcluded(prev => {
@@ -273,12 +308,31 @@ export default function SoloPage() {
                   const qty = Number(p.quantity);
                   const isLong = qty > 0;
                   const upnl = p.unrealized_pnl == null ? null : Number(p.unrealized_pnl);
+                  const closing = isClosing(p);
                   return (
-                    <tr key={k} className="border-t" style={{ borderColor: "var(--border)" }}>
+                    <tr key={k} className="border-t" style={{ borderColor: "var(--border)", opacity: closing ? 0.5 : 1 }}>
                       <td className="px-3 py-2">
-                        <input type="checkbox" checked={!excluded.has(k)} onChange={() => toggle(k)} aria-label={`Exit ${p.broker_symbol}`} />
+                        <input
+                          type="checkbox"
+                          checked={!closing && !excluded.has(k)}
+                          onChange={() => toggle(k)}
+                          disabled={closing}
+                          title={closing ? "Close order in progress" : undefined}
+                          style={closing ? { cursor: "not-allowed" } : undefined}
+                          aria-label={`Exit ${p.broker_symbol}`}
+                        />
                       </td>
-                      <td className="px-3 py-2 num">{p.broker_symbol}</td>
+                      <td className="px-3 py-2 num">
+                        <span className="inline-flex items-center gap-2">
+                          {p.broker_symbol}
+                          {closing && (
+                            <span className="text-[11px] uppercase tracking-wider px-2 py-[2px] rounded whitespace-nowrap font-medium"
+                              style={{ background: "rgba(10,115,168,0.10)", color: "var(--accent)" }}>
+                              closing…
+                            </span>
+                          )}
+                        </span>
+                      </td>
                       <td className="px-3 py-2" style={{ color: isLong ? "var(--good)" : "var(--bad)" }}>{isLong ? "LONG" : "SHORT"}</td>
                       <td className="px-3 py-2 num">{Math.abs(qty)}</td>
                       <td className="px-3 py-2 num">{fmt(p.avg_entry_price)}</td>
