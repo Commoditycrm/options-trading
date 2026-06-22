@@ -152,7 +152,7 @@ def enumerate_fanout_targets(db: Session, trader_id: uuid.UUID) -> list[FanoutTa
     so the freshest realized-P&L number is used. Same for zero-qty skip.
     """
     ts = db.get(TraderSettings, trader_id)
-    if ts is not None and ts.copy_paused:
+    if ts is not None and (ts.copy_paused or ts.solo_mode):
         return []
 
     sub_rows = (
@@ -601,7 +601,7 @@ def queue_fanout(db: Session, trader_order: Order, trader: User) -> int:
     if trader.role != UserRole.TRADER:
         return 0
     ts = db.get(TraderSettings, trader.id)
-    if ts is None or not ts.trading_enabled or ts.copy_paused:
+    if ts is None or not ts.trading_enabled or ts.copy_paused or ts.solo_mode:
         return 0
 
     subs = memory_cache.subscribers_for_trader(trader.id)
@@ -749,7 +749,7 @@ def fanout_inproc(db: Session, trader_order: Order, trader: User) -> int:
     if trader.role != UserRole.TRADER:
         return 0
     ts = db.get(TraderSettings, trader.id)
-    if ts is None or not ts.trading_enabled or ts.copy_paused:
+    if ts is None or not ts.trading_enabled or ts.copy_paused or ts.solo_mode:
         return 0
 
     subs = memory_cache.subscribers_for_trader(trader.id)

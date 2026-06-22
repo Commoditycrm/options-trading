@@ -402,7 +402,12 @@ def _place_trader_order(
     # stamp the flag on the row at creation time (immutable record of intent).
     from app.models.settings import TraderSettings  # local import — avoid cycle
     ts = db.get(TraderSettings, trader.id) if is_trader else None
-    will_fanout = is_trader and not skip_fanout and not (ts and ts.copy_paused)
+    # Solo traders trade only for themselves — never fan out to subscribers.
+    will_fanout = (
+        is_trader and not skip_fanout
+        and not (ts and ts.copy_paused)
+        and not (ts and ts.solo_mode)
+    )
 
     order = Order(
         user_id=trader.id,
